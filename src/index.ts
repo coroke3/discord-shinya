@@ -1,7 +1,7 @@
 import {
-  CLOSE_CRON,
   getConfigIssues,
-  OPEN_CRON,
+  NIGHT_CRON,
+  operationForScheduledTime,
   TIME_ZONE,
   type Env,
 } from "./config";
@@ -14,17 +14,23 @@ type WorkerExecutionContext = Parameters<WorkerFetch>[2];
 const handler: ExportedHandler<Env> = {
   async scheduled(controller: ScheduledController, env: Env): Promise<void> {
     try {
-      if (controller.cron === OPEN_CRON) {
+      if (controller.cron !== NIGHT_CRON) {
+        console.warn(`Ignoring unknown cron trigger: ${controller.cron}`);
+        return;
+      }
+
+      const operation = operationForScheduledTime(controller.scheduledTime);
+      if (operation === "open") {
         await openNightChannels(env, controller.scheduledTime);
         return;
       }
 
-      if (controller.cron === CLOSE_CRON) {
+      if (operation === "close") {
         await closeNightChannels(env);
         return;
       }
 
-      console.warn(`Ignoring unknown cron trigger: ${controller.cron}`);
+      console.warn(`Ignoring cron invocation at unexpected UTC time: ${controller.scheduledTime}`);
     } catch (error) {
       console.error(`Scheduled operation failed for ${controller.cron}`, error);
       throw error;
@@ -47,8 +53,9 @@ const handler: ExportedHandler<Env> = {
           configured: issues.length === 0,
           timezone: TIME_ZONE,
           schedules: {
-            open: OPEN_CRON,
-            close: CLOSE_CRON,
+            open: "0 15 * * *",
+            close: "0 23 * * *",
+            configured: NIGHT_CRON,
           },
           ...(issues.length > 0 ? { configurationIssues: issues } : {}),
         },

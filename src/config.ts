@@ -1,5 +1,8 @@
-export const OPEN_CRON = "0 15 * * *";
-export const CLOSE_CRON = "0 23 * * *";
+// One Cron expression covers both daily boundaries, which keeps the Worker
+// within the account-level free-plan Cron trigger limit.
+export const NIGHT_CRON = "0 15,23 * * *";
+export const OPEN_UTC_HOUR = 15;
+export const CLOSE_UTC_HOUR = 23;
 export const TIME_ZONE = "Asia/Tokyo";
 
 export const TEXT_CHANNEL_PREFIX = "深夜限定テキスト-";
@@ -25,6 +28,8 @@ export interface ChannelNames {
   text: string;
   voice: string;
 }
+
+export type ScheduledOperation = "open" | "close" | null;
 
 const REQUIRED_CONFIG_KEYS = [
   "DISCORD_BOT_TOKEN",
@@ -77,6 +82,17 @@ export function japanDateKey(timestampMs: number): string {
   const month = String(japanTime.getUTCMonth() + 1).padStart(2, "0");
   const day = String(japanTime.getUTCDate()).padStart(2, "0");
   return `${month}-${day}`;
+}
+
+export function operationForScheduledTime(timestampMs: number): ScheduledOperation {
+  const utcHour = new Date(timestampMs).getUTCHours();
+  if (utcHour === OPEN_UTC_HOUR) {
+    return "open";
+  }
+  if (utcHour === CLOSE_UTC_HOUR) {
+    return "close";
+  }
+  return null;
 }
 
 export function channelNames(dateKey: string): ChannelNames {

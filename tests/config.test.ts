@@ -5,12 +5,19 @@ import {
   getConfigIssues,
   isManagedChannel,
   japanDateKey,
+  operationForScheduledTime,
 } from "../src/config";
 
 describe("configuration and channel naming", () => {
   it("formats scheduled UTC timestamps as Japanese MM-DD dates", () => {
     expect(japanDateKey(Date.UTC(2026, 7, 28, 15, 0))).toBe("08-29");
     expect(japanDateKey(Date.UTC(2026, 7, 28, 23, 0))).toBe("08-29");
+  });
+
+  it("maps the combined free-plan cron trigger to open and close operations", () => {
+    expect(operationForScheduledTime(Date.UTC(2026, 7, 28, 15, 0))).toBe("open");
+    expect(operationForScheduledTime(Date.UTC(2026, 7, 28, 23, 0))).toBe("close");
+    expect(operationForScheduledTime(Date.UTC(2026, 7, 28, 16, 0))).toBeNull();
   });
 
   it("builds the requested daily channel names", () => {
