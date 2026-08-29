@@ -4,6 +4,7 @@ export const NIGHT_CRON = "0 15,23 * * *";
 export const OPEN_UTC_HOUR = 15;
 export const CLOSE_UTC_HOUR = 23;
 export const TIME_ZONE = "Asia/Tokyo";
+export const MESSAGE_LOG_CHANNEL_ID = "1543273845257928747";
 
 export const TEXT_CHANNEL_PREFIX = "深夜限定テキスト-";
 export const VOICE_CHANNEL_PREFIX = "深夜限定通話-";
@@ -22,6 +23,10 @@ export interface DiscordChannel {
   type: number;
   parent_id?: string | null;
   guild_id?: string;
+}
+
+export interface DiscordMessage {
+  id: string;
 }
 
 export interface ChannelNames {
@@ -100,6 +105,10 @@ export function channelNames(dateKey: string): ChannelNames {
     text: `${TEXT_CHANNEL_PREFIX}${dateKey}`,
     voice: `${VOICE_CHANNEL_PREFIX}${dateKey}`,
   };
+}
+
+export function buildMessageCountLog(messageCount: number): string {
+  return `今日のメッセージ数：${messageCount}件\n今日もお疲れ様でした！おはようございます！`;
 }
 
 export function isManagedChannel(

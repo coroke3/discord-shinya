@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildAnnouncementPayload,
+  buildMessageCountLog,
   channelNames,
   getConfigIssues,
   isManagedChannel,
@@ -62,6 +63,12 @@ describe("configuration and channel naming", () => {
         roles: ["123456789"],
       },
     });
+  });
+
+  it("formats the message count log exactly", () => {
+    expect(buildMessageCountLog(12)).toBe(
+      "今日のメッセージ数：12件\n今日もお疲れ様でした！おはようございます！",
+    );
   });
 
   it("reports missing runtime configuration without exposing values", () => {

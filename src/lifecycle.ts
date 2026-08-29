@@ -1,7 +1,9 @@
 import {
   assertConfig,
   buildAnnouncementPayload,
+  buildMessageCountLog,
   channelNames,
+  MESSAGE_LOG_CHANNEL_ID,
   type DiscordChannel,
   type Env,
   isDryRun,
@@ -11,6 +13,8 @@ import {
 import {
   createAnnouncement,
   createGuildChannel,
+  createTextMessage,
+  countChannelMessages,
   deleteChannel,
   DiscordApiError,
   listGuildChannels,
@@ -89,6 +93,27 @@ export async function closeNightChannels(env: Env): Promise<void> {
   }
 
   const managed = await getManagedChannels(env);
+
+  // Try to record the text-channel total before deleting any managed channel.
+  // Counting/logging is best-effort: deletion must still proceed if either
+  // operation fails.
+  for (const channel of managed.filter((candidate) => candidate.type === 0)) {
+    try {
+      const messageCount = await countChannelMessages(env, channel.id);
+      await createTextMessage(
+        env,
+        MESSAGE_LOG_CHANNEL_ID,
+        buildMessageCountLog(messageCount),
+      );
+      console.log(`Logged ${messageCount} message(s) for ${channel.name ?? channel.id}.`);
+    } catch (error) {
+      console.error(
+        `Message count logging failed for ${channel.name ?? channel.id}; continuing with deletion.`,
+        error,
+      );
+    }
+  }
+
   await deleteManagedChannels(env, managed, "closing cleanup");
   console.log(`Deleted ${managed.length} managed night channel(s).`);
 }

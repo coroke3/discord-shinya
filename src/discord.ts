@@ -1,7 +1,9 @@
-import type { DiscordChannel, Env } from "./config";
+import type { DiscordChannel, DiscordMessage, Env } from "./config";
 
 const DISCORD_API_BASE = "https://discord.com/api/v10";
 const MAX_RETRIES = 2;
+const MESSAGE_PAGE_SIZE = 100;
+const MAX_MESSAGE_COUNT_PAGES = 45;
 
 export class DiscordApiError extends Error {
   constructor(
@@ -37,6 +39,64 @@ export async function createGuildChannel(
 export async function deleteChannel(env: Env, channelId: string): Promise<void> {
   await discordRequest<DiscordChannel>(env, `/channels/${channelId}`, {
     method: "DELETE",
+  });
+}
+
+export async function listChannelMessages(
+  env: Env,
+  channelId: string,
+  before?: string,
+): Promise<DiscordMessage[]> {
+  const query = new URLSearchParams({ limit: String(MESSAGE_PAGE_SIZE) });
+  if (before) {
+    query.set("before", before);
+  }
+
+  return discordRequest<DiscordMessage[]>(
+    env,
+    `/channels/${channelId}/messages?${query.toString()}`,
+    { method: "GET" },
+  );
+}
+
+export async function countChannelMessages(
+  env: Env,
+  channelId: string,
+): Promise<number> {
+  let before: string | undefined;
+  let count = 0;
+
+  for (let page = 0; page < MAX_MESSAGE_COUNT_PAGES; page += 1) {
+    const messages = await listChannelMessages(env, channelId, before);
+    count += messages.length;
+
+    if (messages.length < MESSAGE_PAGE_SIZE) {
+      return count;
+    }
+
+    const oldestMessageId = messages[messages.length - 1]?.id;
+    if (!oldestMessageId) {
+      throw new Error(`Discord returned a full message page without an ID for ${channelId}`);
+    }
+    before = oldestMessageId;
+  }
+
+  throw new Error(
+    `Message count exceeded the safe pagination limit for channel ${channelId}`,
+  );
+}
+
+export async function createTextMessage(
+  env: Env,
+  channelId: string,
+  content: string,
+): Promise<void> {
+  await discordRequest(env, `/channels/${channelId}/messages`, {
+    method: "POST",
+    body: JSON.stringify({
+      content,
+      allowed_mentions: { parse: [] },
+    }),
   });
 }
 
