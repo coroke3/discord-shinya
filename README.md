@@ -58,10 +58,10 @@ npm.cmd run dev
 Wrangler にログインした状態で、以下を実行します。値の入力は対話式で行われ、ソースコードには保存されません。
 
 ```powershell
-npm.cmd exec wrangler secret put DISCORD_BOT_TOKEN
-npm.cmd exec wrangler secret put DISCORD_GUILD_ID
-npm.cmd exec wrangler secret put DISCORD_PARENT_CATEGORY_ID
-npm.cmd exec wrangler secret put DISCORD_MENTION_ROLE_ID
+npm.cmd exec wrangler -- secret put DISCORD_BOT_TOKEN
+npm.cmd exec wrangler -- secret put DISCORD_GUILD_ID
+npm.cmd exec wrangler -- secret put DISCORD_PARENT_CATEGORY_ID
+npm.cmd exec wrangler -- secret put DISCORD_MENTION_ROLE_ID
 npm.cmd run deploy
 ```
 
