@@ -1,0 +1,7 @@
+# Local-only values. Never commit a real .dev.vars file.
+DISCORD_BOT_TOKEN=
+DISCORD_GUILD_ID=
+DISCORD_PARENT_CATEGORY_ID=
+DISCORD_MENTION_ROLE_ID=
+# Set to true to exercise the scheduler without calling Discord.
+DRY_RUN=false

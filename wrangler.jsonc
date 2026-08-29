@@ -1,0 +1,15 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "discord-shinya",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-29",
+  "observability": {
+    "enabled": true
+  },
+  "triggers": {
+    "crons": [
+      "0 15 * * *",
+      "0 23 * * *"
+    ]
+  }
+}
