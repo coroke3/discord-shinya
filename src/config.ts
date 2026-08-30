@@ -107,8 +107,12 @@ export function channelNames(dateKey: string): ChannelNames {
   };
 }
 
+export function buildMorningGreeting(): string {
+  return "今日もお疲れ様でした！おはようございます！";
+}
+
 export function buildMessageCountLog(messageCount: number): string {
-  return `今日のメッセージ数：${messageCount}件\n今日もお疲れ様でした！おはようございます！`;
+  return `今日のメッセージ数：${messageCount}件\n${buildMorningGreeting()}`;
 }
 
 export function isManagedChannel(

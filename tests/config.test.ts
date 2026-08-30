@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildAnnouncementPayload,
+  buildMorningGreeting,
   buildMessageCountLog,
   channelNames,
   getConfigIssues,
@@ -69,6 +70,10 @@ describe("configuration and channel naming", () => {
     expect(buildMessageCountLog(12)).toBe(
       "今日のメッセージ数：12件\n今日もお疲れ様でした！おはようございます！",
     );
+  });
+
+  it("formats the fallback morning greeting exactly", () => {
+    expect(buildMorningGreeting()).toBe("今日もお疲れ様でした！おはようございます！");
   });
 
   it("reports missing runtime configuration without exposing values", () => {

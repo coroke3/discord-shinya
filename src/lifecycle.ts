@@ -1,6 +1,7 @@
 import {
   assertConfig,
   buildAnnouncementPayload,
+  buildMorningGreeting,
   buildMessageCountLog,
   channelNames,
   MESSAGE_LOG_CHANNEL_ID,
@@ -98,8 +99,27 @@ export async function closeNightChannels(env: Env): Promise<void> {
   // Counting/logging is best-effort: deletion must still proceed if either
   // operation fails.
   for (const channel of managed.filter((candidate) => candidate.type === 0)) {
+    let messageCount: number;
+
     try {
-      const messageCount = await countChannelMessages(env, channel.id);
+      messageCount = await countChannelMessages(env, channel.id);
+    } catch (error) {
+      console.error(
+        `Message count retrieval failed for ${channel.name ?? channel.id}; posting greeting only: ${describeError(error)}`,
+      );
+
+      try {
+        await createTextMessage(env, MESSAGE_LOG_CHANNEL_ID, buildMorningGreeting());
+        console.log(`Logged greeting only for ${channel.name ?? channel.id}.`);
+      } catch (greetingError) {
+        console.error(
+          `Greeting logging failed for ${channel.name ?? channel.id}; continuing with deletion: ${describeError(greetingError)}`,
+        );
+      }
+      continue;
+    }
+
+    try {
       await createTextMessage(
         env,
         MESSAGE_LOG_CHANNEL_ID,
@@ -108,8 +128,7 @@ export async function closeNightChannels(env: Env): Promise<void> {
       console.log(`Logged ${messageCount} message(s) for ${channel.name ?? channel.id}.`);
     } catch (error) {
       console.error(
-        `Message count logging failed for ${channel.name ?? channel.id}; continuing with deletion.`,
-        error,
+        `Message count log posting failed for ${channel.name ?? channel.id}; continuing with deletion: ${describeError(error)}`,
       );
     }
   }
@@ -150,6 +169,10 @@ async function deleteManagedChannels(
   if (failures.length > 0) {
     throw new Error(`${operation} failed for ${failures.length} channel(s)`);
   }
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function rollbackCreatedChannels(
