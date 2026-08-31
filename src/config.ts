@@ -6,8 +6,10 @@ export const CLOSE_UTC_HOUR = 23;
 export const TIME_ZONE = "Asia/Tokyo";
 export const MESSAGE_LOG_CHANNEL_ID = "1543273845257928747";
 
-export const TEXT_CHANNEL_PREFIX = "深夜限定テキスト-";
-export const VOICE_CHANNEL_PREFIX = "深夜限定通話-";
+export const TEXT_CHANNEL_PREFIX = "深夜限定テキスト";
+export const VOICE_CHANNEL_PREFIX = "深夜限定通話";
+const LEGACY_TEXT_CHANNEL_PREFIX = "深夜限定テキスト-";
+const LEGACY_VOICE_CHANNEL_PREFIX = "深夜限定通話-";
 
 export interface Env {
   DISCORD_BOT_TOKEN: string;
@@ -30,8 +32,8 @@ export interface DiscordMessage {
 }
 
 export interface ChannelNames {
-  text: string;
-  voice: string;
+  text: readonly [string, string];
+  voice: readonly [string, string];
 }
 
 export type ScheduledOperation = "open" | "close" | null;
@@ -102,8 +104,14 @@ export function operationForScheduledTime(timestampMs: number): ScheduledOperati
 
 export function channelNames(dateKey: string): ChannelNames {
   return {
-    text: `${TEXT_CHANNEL_PREFIX}${dateKey}`,
-    voice: `${VOICE_CHANNEL_PREFIX}${dateKey}`,
+    text: [
+      `${TEXT_CHANNEL_PREFIX}1-${dateKey}`,
+      `${TEXT_CHANNEL_PREFIX}2-${dateKey}`,
+    ],
+    voice: [
+      `${VOICE_CHANNEL_PREFIX}1-${dateKey}`,
+      `${VOICE_CHANNEL_PREFIX}2-${dateKey}`,
+    ],
   };
 }
 
@@ -124,14 +132,24 @@ export function isManagedChannel(
   }
 
   if (channel.type === 0) {
-    return new RegExp(`^${escapeRegExp(TEXT_CHANNEL_PREFIX)}\\d{2}-\\d{2}$`).test(
-      channel.name ?? "",
+    return (
+      new RegExp(`^${escapeRegExp(TEXT_CHANNEL_PREFIX)}[12]-\\d{2}-\\d{2}$`).test(
+        channel.name ?? "",
+      ) ||
+      new RegExp(`^${escapeRegExp(LEGACY_TEXT_CHANNEL_PREFIX)}\\d{2}-\\d{2}$`).test(
+        channel.name ?? "",
+      )
     );
   }
 
   if (channel.type === 2) {
-    return new RegExp(`^${escapeRegExp(VOICE_CHANNEL_PREFIX)}\\d{2}-\\d{2}$`).test(
-      channel.name ?? "",
+    return (
+      new RegExp(`^${escapeRegExp(VOICE_CHANNEL_PREFIX)}[12]-\\d{2}-\\d{2}$`).test(
+        channel.name ?? "",
+      ) ||
+      new RegExp(`^${escapeRegExp(LEGACY_VOICE_CHANNEL_PREFIX)}\\d{2}-\\d{2}$`).test(
+        channel.name ?? "",
+      )
     );
   }
 

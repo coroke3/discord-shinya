@@ -3,7 +3,10 @@ import type { DiscordChannel, DiscordMessage, Env } from "./config";
 const DISCORD_API_BASE = "https://discord.com/api/v10";
 const MAX_RETRIES = 2;
 const MESSAGE_PAGE_SIZE = 100;
-const MAX_MESSAGE_COUNT_PAGES = 45;
+// The close operation counts two text channels and deletes four channels.
+// Keep pagination bounded so the normal path remains below the Workers Free
+// plan's 50-subrequest invocation limit.
+const MAX_MESSAGE_COUNT_PAGES = 20;
 
 export class DiscordApiError extends Error {
   constructor(

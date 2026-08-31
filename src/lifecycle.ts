@@ -30,17 +30,17 @@ export async function openNightChannels(
   const names = channelNames(dateKey);
 
   if (isDryRun(env)) {
-    console.log(`[dry-run] would open ${names.text} and ${names.voice}`);
-    console.log(`[dry-run] would announce in ${names.text}`);
+    console.log(`[dry-run] would open ${names.text.join(", ")} and ${names.voice.join(", ")}`);
+    console.log(`[dry-run] would announce in ${names.text[0]}`);
     return;
   }
 
   const allManaged = await getManagedChannels(env);
   const currentText = allManaged.filter(
-    (channel) => channel.type === 0 && channel.name === names.text,
+    (channel) => channel.type === 0 && names.text.includes(channel.name ?? ""),
   );
   const currentVoice = allManaged.filter(
-    (channel) => channel.type === 2 && channel.name === names.voice,
+    (channel) => channel.type === 2 && names.voice.includes(channel.name ?? ""),
   );
   const stale = allManaged.filter(
     (channel) => !currentText.includes(channel) && !currentVoice.includes(channel),
@@ -48,7 +48,10 @@ export async function openNightChannels(
 
   await deleteManagedChannels(env, stale, "opening cleanup");
 
-  if (currentText.length === 1 && currentVoice.length === 1) {
+  if (
+    hasExpectedChannels(currentText, names.text) &&
+    hasExpectedChannels(currentVoice, names.voice)
+  ) {
     console.log(`Night channels already exist for ${dateKey}; no duplicate creation.`);
     return;
   }
@@ -58,27 +61,40 @@ export async function openNightChannels(
 
   const created: DiscordChannel[] = [];
   try {
-    const textChannel = await createGuildChannel(env, {
-      name: names.text,
-      type: 0,
-      parent_id: env.DISCORD_PARENT_CATEGORY_ID,
-    });
-    created.push(textChannel);
+    const textChannels: DiscordChannel[] = [];
+    for (const name of names.text) {
+      const channel = await createGuildChannel(env, {
+        name,
+        type: 0,
+        parent_id: env.DISCORD_PARENT_CATEGORY_ID,
+      });
+      created.push(channel);
+      textChannels.push(channel);
+    }
 
-    const voiceChannel = await createGuildChannel(env, {
-      name: names.voice,
-      type: 2,
-      parent_id: env.DISCORD_PARENT_CATEGORY_ID,
-    });
-    created.push(voiceChannel);
+    for (const name of names.voice) {
+      const channel = await createGuildChannel(env, {
+        name,
+        type: 2,
+        parent_id: env.DISCORD_PARENT_CATEGORY_ID,
+      });
+      created.push(channel);
+    }
+
+    const announcementChannel = textChannels[0];
+    if (!announcementChannel) {
+      throw new Error("No text channel was created for the announcement");
+    }
 
     await createAnnouncement(
       env,
-      textChannel.id,
+      announcementChannel.id,
       buildAnnouncementPayload(env.DISCORD_MENTION_ROLE_ID),
     );
 
-    console.log(`Created ${names.text} and ${names.voice}; announcement sent.`);
+    console.log(
+      `Created ${[...names.text, ...names.voice].join(", ")}; announcement sent in ${names.text[0]}.`,
+    );
   } catch (error) {
     await rollbackCreatedChannels(env, created);
     throw error;
@@ -98,38 +114,47 @@ export async function closeNightChannels(env: Env): Promise<void> {
   // Try to record the text-channel total before deleting any managed channel.
   // Counting/logging is best-effort: deletion must still proceed if either
   // operation fails.
-  for (const channel of managed.filter((candidate) => candidate.type === 0)) {
-    let messageCount: number;
+  const textChannels = managed.filter((candidate) => candidate.type === 0);
+  if (textChannels.length > 0) {
+    let totalMessageCount = 0;
+    let messageCountFailed = false;
 
-    try {
-      messageCount = await countChannelMessages(env, channel.id);
-    } catch (error) {
-      console.error(
-        `Message count retrieval failed for ${channel.name ?? channel.id}; posting greeting only: ${describeError(error)}`,
-      );
-
+    for (const channel of textChannels) {
       try {
-        await createTextMessage(env, MESSAGE_LOG_CHANNEL_ID, buildMorningGreeting());
-        console.log(`Logged greeting only for ${channel.name ?? channel.id}.`);
-      } catch (greetingError) {
+        totalMessageCount += await countChannelMessages(env, channel.id);
+      } catch (error) {
+        messageCountFailed = true;
         console.error(
-          `Greeting logging failed for ${channel.name ?? channel.id}; continuing with deletion: ${describeError(greetingError)}`,
+          `Message count retrieval failed for ${channel.name ?? channel.id}; posting greeting only: ${describeError(error)}`,
         );
+        break;
       }
-      continue;
     }
 
-    try {
-      await createTextMessage(
-        env,
-        MESSAGE_LOG_CHANNEL_ID,
-        buildMessageCountLog(messageCount),
-      );
-      console.log(`Logged ${messageCount} message(s) for ${channel.name ?? channel.id}.`);
-    } catch (error) {
-      console.error(
-        `Message count log posting failed for ${channel.name ?? channel.id}; continuing with deletion: ${describeError(error)}`,
-      );
+    if (messageCountFailed) {
+      try {
+        await createTextMessage(env, MESSAGE_LOG_CHANNEL_ID, buildMorningGreeting());
+        console.log(`Logged greeting only for ${textChannels.length} text channel(s).`);
+      } catch (greetingError) {
+        console.error(
+          `Greeting logging failed; continuing with deletion: ${describeError(greetingError)}`,
+        );
+      }
+    } else {
+      try {
+        await createTextMessage(
+          env,
+          MESSAGE_LOG_CHANNEL_ID,
+          buildMessageCountLog(totalMessageCount),
+        );
+        console.log(
+          `Logged ${totalMessageCount} message(s) across ${textChannels.length} text channel(s).`,
+        );
+      } catch (error) {
+        console.error(
+          `Message count log posting failed for ${textChannels.length} text channel(s); continuing with deletion: ${describeError(error)}`,
+        );
+      }
     }
   }
 
@@ -141,6 +166,16 @@ async function getManagedChannels(env: Env): Promise<DiscordChannel[]> {
   const channels = await listGuildChannels(env);
   return channels.filter((channel) =>
     isManagedChannel(channel, env.DISCORD_PARENT_CATEGORY_ID),
+  );
+}
+
+function hasExpectedChannels(
+  channels: DiscordChannel[],
+  expectedNames: readonly string[],
+): boolean {
+  return (
+    channels.length === expectedNames.length &&
+    expectedNames.every((name) => channels.some((channel) => channel.name === name))
   );
 }
 

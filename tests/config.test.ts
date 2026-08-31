@@ -24,33 +24,63 @@ describe("configuration and channel naming", () => {
 
   it("builds the requested daily channel names", () => {
     expect(channelNames("08-29")).toEqual({
-      text: "深夜限定テキスト-08-29",
-      voice: "深夜限定通話-08-29",
+      text: ["深夜限定テキスト1-08-29", "深夜限定テキスト2-08-29"],
+      voice: ["深夜限定通話1-08-29", "深夜限定通話2-08-29"],
     });
   });
 
   it("only accepts managed names under the configured category", () => {
     expect(
       isManagedChannel(
-        { id: "1", type: 0, name: "深夜限定テキスト-08-29", parent_id: "99" },
+        { id: "1", type: 0, name: "深夜限定テキスト1-08-29", parent_id: "99" },
         "99",
       ),
     ).toBe(true);
     expect(
       isManagedChannel(
-        { id: "2", type: 2, name: "深夜限定通話-08-29", parent_id: "99" },
+        { id: "2", type: 0, name: "深夜限定テキスト2-08-29", parent_id: "99" },
         "99",
       ),
     ).toBe(true);
     expect(
       isManagedChannel(
-        { id: "3", type: 0, name: "深夜限定テキスト-08-29", parent_id: "100" },
+        { id: "3", type: 2, name: "深夜限定通話1-08-29", parent_id: "99" },
+        "99",
+      ),
+    ).toBe(true);
+    expect(
+      isManagedChannel(
+        { id: "4", type: 2, name: "深夜限定通話2-08-29", parent_id: "99" },
+        "99",
+      ),
+    ).toBe(true);
+    expect(
+      isManagedChannel(
+        { id: "5", type: 0, name: "深夜限定テキスト-08-29", parent_id: "99" },
+        "99",
+      ),
+    ).toBe(true);
+    expect(
+      isManagedChannel(
+        { id: "6", type: 2, name: "深夜限定通話-08-29", parent_id: "99" },
+        "99",
+      ),
+    ).toBe(true);
+    expect(
+      isManagedChannel(
+        { id: "7", type: 0, name: "深夜限定テキスト1-08-29", parent_id: "100" },
         "99",
       ),
     ).toBe(false);
     expect(
       isManagedChannel(
-        { id: "4", type: 0, name: "深夜限定テキスト-雑談", parent_id: "99" },
+        { id: "8", type: 0, name: "深夜限定テキスト3-08-29", parent_id: "99" },
+        "99",
+      ),
+    ).toBe(false);
+    expect(
+      isManagedChannel(
+        { id: "9", type: 0, name: "深夜限定テキスト-雑談", parent_id: "99" },
         "99",
       ),
     ).toBe(false);
