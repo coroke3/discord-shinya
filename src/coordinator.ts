@@ -134,6 +134,34 @@ const NON_RESUMABLE_GATEWAY_CODES = new Set([
   4014,
 ]);
 
+// 08:00の終了処理が完全に成功したら削除する日次・接続中だけの状態。
+// 次回の運用判定に必要なphase、ロール同期完了状態、現在の深層ロール集合は残す。
+const DAILY_EPHEMERAL_STATE_KEYS = [
+  "alarm_due",
+  "date_jst",
+  "pending_operation",
+  "open_after_cleanup",
+  "next_open_date",
+  "message_count",
+  "message_count_available",
+  "visitor_count",
+  "report_sent",
+  "detail_report_sent",
+  "role_queue_initialized",
+  "close_stage",
+  "opening_stage",
+  "opening_cleanup_done",
+  "gateway_session_id",
+  "gateway_resume_url",
+  "gateway_last_sequence",
+  "gateway_resume_pending",
+  "gateway_connected",
+  "gateway_bot_user_id",
+  "gateway_heartbeat_ack_at",
+  "gateway_heartbeat_sent_at",
+  "gateway_watchdog_due",
+] as const;
+
 /**
  * One coordinator exists per guild. All durable state that can affect a
  * future operation is kept in SQLite; the in-memory fields only hold the
@@ -657,13 +685,10 @@ export class NightCoordinator {
     this.deleteActiveSessions(dateJst);
 
     if (roleSyncComplete && reportsComplete && this.getState("close_stage") === "done") {
-      this.setState("phase", "CLOSED");
-      this.setState("close_stage", "done");
       const nextOpenDate = this.getState("next_open_date");
       const shouldOpenNextDay = this.getState("open_after_cleanup") === "1" && nextOpenDate;
-      this.setState("open_after_cleanup", "0");
-      this.setState("next_open_date", "");
-      this.setState("pending_operation", "");
+      this.clearDailyEphemeralState();
+      this.setState("phase", "CLOSED");
       if (shouldOpenNextDay && nextOpenDate) {
         await this.beginOpen(nextOpenDate);
       }
@@ -676,6 +701,16 @@ export class NightCoordinator {
       this.setState("phase", "REPORTING");
     }
     await this.scheduleAlarmAt(Date.now() + 300_000);
+  }
+
+  private clearDailyEphemeralState(): void {
+    const placeholders = DAILY_EPHEMERAL_STATE_KEYS.map(() => "?").join(", ");
+    this.ctx.storage.sql.exec(
+      `DELETE FROM service_state WHERE key IN (${placeholders})`,
+      ...DAILY_EPHEMERAL_STATE_KEYS,
+    );
+    // 次の日に持ち越すのは、現在のフェーズとロール同期の完了状態だけにする。
+    this.setState("metrics_integrity", "complete");
   }
 
   private async lockRegisteredChannels(dateJst: string): Promise<void> {
