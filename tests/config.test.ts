@@ -53,6 +53,20 @@ describe("新しい深夜チャンネル構成", () => {
     });
   });
 
+  it("深層チャンネルだけ別カテゴリへ配置する", () => {
+    const definitions = channelDefinitions("08-29", "99", "88", "77", "66");
+    expect(new Set(
+      definitions
+        .filter((definition) => definition.kind === "normal_text" || definition.kind === "normal_voice")
+        .map((definition) => definition.parent_id),
+    )).toEqual(new Set(["77"]));
+    expect(new Set(
+      definitions
+        .filter((definition) => definition.kind === "deep_text" || definition.kind === "deep_voice")
+        .map((definition) => definition.parent_id),
+    )).toEqual(new Set(["66"]));
+  });
+
   it("厳密な名前と親カテゴリだけを管理対象にする", () => {
     expect(isManagedChannel({ id: "1", type: 0, name: "深層-深夜限定テキスト1-08-29", parent_id: "99" }, "99"))
       .toBe(true);
@@ -64,6 +78,16 @@ describe("新しい深夜チャンネル構成", () => {
       .toBe(false);
     expect(isManagedChannel({ id: "5", type: 0, name: "深夜限定テキスト-08-29", parent_id: "99" }, "99"))
       .toBe(true);
+    expect(isManagedChannel(
+      { id: "6", type: 0, name: "深層-深夜限定テキスト1-08-29", parent_id: "66" },
+      "99",
+      "66",
+    )).toBe(true);
+    expect(isManagedChannel(
+      { id: "7", type: 0, name: "深層-深夜限定テキスト1-08-29", parent_id: "100" },
+      "99",
+      "66",
+    )).toBe(false);
   });
 
   it("@hereと指定ロールを同時に許可する", () => {
@@ -123,10 +147,21 @@ describe("新しい深夜チャンネル構成", () => {
       "DISCORD_BOT_TOKEN is missing",
       "DISCORD_GUILD_ID is missing",
       "DISCORD_PARENT_CATEGORY_ID is missing",
+      "DISCORD_DEEP_PARENT_CATEGORY_ID is missing",
       "DISCORD_MENTION_ROLE_ID is missing",
       "DISCORD_DEEP_ROLE_ID is missing",
       "DISCORD_ACTIVITY_DETAIL_CHANNEL_ID is missing",
     ]);
     expect(issues.join(" ")).not.toContain("secret");
+  });
+
+  it("通常カテゴリと深層カテゴリの同一指定を拒否する", () => {
+    const issues = getConfigIssues({
+      DISCORD_PARENT_CATEGORY_ID: "123456789012345678",
+      DISCORD_DEEP_PARENT_CATEGORY_ID: "123456789012345678",
+    });
+    expect(issues).toContain(
+      "DISCORD_DEEP_PARENT_CATEGORY_ID must differ from DISCORD_PARENT_CATEGORY_ID",
+    );
   });
 });

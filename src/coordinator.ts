@@ -31,6 +31,7 @@ import {
   DiscordRateLimitError,
   initialGatewayUrl,
   listGuildChannels,
+  normalizeGatewayUrl,
   putChannelPermission,
   removeGuildMemberRole,
 } from "./discord";
@@ -323,10 +324,17 @@ export class NightCoordinator {
     // チャンネルを初期化しない。Alarmや重複Cronが同時期に走っても、
     // 未完了の段階から再開する。
     if (retryingCurrentOpening) {
+      // 外部API処理の途中で実行コンテキストが終了しても、OPENINGを
+      // 再開できるよう先に監視用Alarmを確保する。
+      await this.scheduleGatewayWatchdog();
       if (this.getState("opening_cleanup_done") !== "1") {
         const channels = await listGuildChannels(this.env);
         const stale = channels.filter((channel) =>
-          classifyManagedChannel(channel, this.env.DISCORD_PARENT_CATEGORY_ID) !== null,
+          classifyManagedChannel(
+            channel,
+            this.env.DISCORD_PARENT_CATEGORY_ID,
+            this.env.DISCORD_DEEP_PARENT_CATEGORY_ID,
+          ) !== null,
         );
         if (!await this.deleteChannels(stale.map((channel) => channel.id))) {
           return;
@@ -373,12 +381,19 @@ export class NightCoordinator {
     this.setState("role_sync_complete", "0");
     this.setState("close_stage", "flush");
     this.setState("opening_cleanup_done", "0");
+    // 一覧取得・古いチャンネル削除が長引いてもOPENINGを再試行できるよう、
+    // 破壊的な外部API処理より先に監視用Alarmを登録する。
+    await this.scheduleGatewayWatchdog();
 
     // Only exact managed names in the configured category are eligible for
     // cleanup. Unrelated channels are never touched.
     const channels = await listGuildChannels(this.env);
     const stale = channels.filter((channel) =>
-      classifyManagedChannel(channel, this.env.DISCORD_PARENT_CATEGORY_ID) !== null,
+      classifyManagedChannel(
+        channel,
+        this.env.DISCORD_PARENT_CATEGORY_ID,
+        this.env.DISCORD_DEEP_PARENT_CATEGORY_ID,
+      ) !== null,
     );
     if (!await this.deleteChannels(stale.map((channel) => channel.id))) {
       return;
@@ -399,6 +414,10 @@ export class NightCoordinator {
       return;
     }
 
+    // チャンネル作成が複数回の外部API呼び出しになるため、作成処理の前に
+    // 監視用Alarmを確保する。既存Alarmが早ければそちらを維持する。
+    await this.scheduleGatewayWatchdog();
+
     const dateJst = this.getState("date_jst");
     if (!dateJst) {
       throw new Error("Opening has no JST date");
@@ -409,6 +428,7 @@ export class NightCoordinator {
       this.env.DISCORD_GUILD_ID,
       this.env.DISCORD_DEEP_ROLE_ID,
       this.env.DISCORD_PARENT_CATEGORY_ID,
+      this.env.DISCORD_DEEP_PARENT_CATEGORY_ID,
       this.getState("gateway_bot_user_id") ?? undefined,
     );
     const created: string[] = [];
@@ -417,8 +437,14 @@ export class NightCoordinator {
       const current = await listGuildChannels(this.env);
       const currentByName = new Map(
         current
-          .filter((channel) => channel.parent_id === this.env.DISCORD_PARENT_CATEGORY_ID)
-          .map((channel) => [`${channel.type}:${channel.name ?? ""}`, channel] as const),
+          .filter((channel) =>
+            channel.parent_id === this.env.DISCORD_PARENT_CATEGORY_ID ||
+            channel.parent_id === this.env.DISCORD_DEEP_PARENT_CATEGORY_ID,
+          )
+          .map((channel) => [
+            `${channel.parent_id}:${channel.type}:${channel.name ?? ""}`,
+            channel,
+          ] as const),
       );
       const registeredByName = new Map(
         this.registeredChannels().map((channel) => [`${channel.kind}:${channel.name}`, channel] as const),
@@ -429,7 +455,9 @@ export class NightCoordinator {
         if (existing) {
           continue;
         }
-        const existingRemote = currentByName.get(`${definition.type}:${definition.name}`);
+        const existingRemote = currentByName.get(
+          `${definition.parent_id}:${definition.type}:${definition.name}`,
+        );
         if (existingRemote) {
           this.registerManagedChannel(existingRemote.id, definition.name, definition.kind, dateJst);
           continue;
@@ -445,11 +473,6 @@ export class NightCoordinator {
       if (!firstText || !firstDeepText) {
         throw new Error("Required announcement text channels were not registered");
       }
-
-      // Schedule the watchdog while the opening phase is still active. Once
-      // the announcement succeeds, only synchronous state writes remain, so
-      // a retry cannot roll back a successfully announced opening.
-      await this.scheduleGatewayWatchdog();
 
       // The Gateway is READY before this call, so both bot-generated
       // announcements are counted by MESSAGE_CREATE without reading history.
@@ -528,6 +551,10 @@ export class NightCoordinator {
       this.connectGateway();
     }
 
+    // 公開権限の反映は複数の外部API呼び出しになるため、処理開始時点で
+    // OPENING/公開処理の復旧用Alarmを確保する。
+    await this.scheduleGatewayWatchdog();
+
     const deepChannels = this.registeredChannels().filter(
       (channel) => channel.kind === "deep_text" || channel.kind === "deep_voice",
     );
@@ -543,12 +570,16 @@ export class NightCoordinator {
     for (const channel of deepChannels) {
       const remote = remoteById.get(channel.channel_id);
       const remoteKind = remote
-        ? classifyManagedChannel(remote, this.env.DISCORD_PARENT_CATEGORY_ID)
+        ? classifyManagedChannel(
+          remote,
+          this.env.DISCORD_PARENT_CATEGORY_ID,
+          this.env.DISCORD_DEEP_PARENT_CATEGORY_ID,
+        )
         : null;
       if (
         !remote ||
         remote.name !== channel.name ||
-        remote.parent_id !== this.env.DISCORD_PARENT_CATEGORY_ID ||
+        remote.parent_id !== this.env.DISCORD_DEEP_PARENT_CATEGORY_ID ||
         remoteKind !== channel.kind
       ) {
         throw new Error(`Deep channel validation failed: ${channel.channel_id}`);
@@ -587,6 +618,9 @@ export class NightCoordinator {
     if (!dateJst) {
       throw new Error("Closing has no JST date");
     }
+    // 08:00処理はDiscord APIを複数回呼ぶため、実行コンテキストが途中で
+    // 終了しても同じclose_stageから再開できるよう、先に復旧Alarmを置く。
+    await this.scheduleAlarmAt(Date.now() + 300_000);
     const cutoff = japanNightEndMs(dateJst);
     const stage = (this.getState("close_stage") as CloseStage | null) ?? "flush";
 
@@ -801,6 +835,8 @@ export class NightCoordinator {
       const shouldOpenNextDay = this.getState("open_after_cleanup") === "1" && nextOpenDate;
       this.clearDailyEphemeralState();
       this.setState("phase", "CLOSED");
+      // 成功後に残った復旧Alarmを消し、次の日の処理だけが新しいAlarmを作る。
+      await this.ctx.storage.deleteAlarm();
       if (shouldOpenNextDay && nextOpenDate) {
         await this.beginOpen(nextOpenDate);
       }
@@ -839,12 +875,19 @@ export class NightCoordinator {
     for (const channel of registered) {
       const remote = remoteById.get(channel.channel_id);
       const remoteKind = remote
-        ? classifyManagedChannel(remote, this.env.DISCORD_PARENT_CATEGORY_ID)
+        ? classifyManagedChannel(
+          remote,
+          this.env.DISCORD_PARENT_CATEGORY_ID,
+          this.env.DISCORD_DEEP_PARENT_CATEGORY_ID,
+        )
         : null;
+      const expectedParentId = channel.kind.startsWith("deep_")
+        ? this.env.DISCORD_DEEP_PARENT_CATEGORY_ID
+        : this.env.DISCORD_PARENT_CATEGORY_ID;
       if (
         !remote ||
         remote.name !== channel.name ||
-        remote.parent_id !== this.env.DISCORD_PARENT_CATEGORY_ID ||
+        remote.parent_id !== expectedParentId ||
         remoteKind !== channel.kind
       ) {
         this.ctx.storage.sql.exec(
@@ -892,13 +935,14 @@ export class NightCoordinator {
         this.env.DISCORD_GUILD_ID,
         this.env.DISCORD_DEEP_ROLE_ID,
         this.env.DISCORD_PARENT_CATEGORY_ID,
-      ).map((definition) => [definition.name, definition.kind] as const),
+        this.env.DISCORD_DEEP_PARENT_CATEGORY_ID,
+      ).map((definition) => [definition.name, definition] as const),
     );
     const remote = await listGuildChannels(this.env);
     for (const channel of remote) {
-      const kind = expected.get(channel.name ?? "");
-      if (kind && channel.parent_id === this.env.DISCORD_PARENT_CATEGORY_ID) {
-        this.registerManagedChannel(channel.id, channel.name ?? "", kind, dateJst);
+      const definition = expected.get(channel.name ?? "");
+      if (definition && channel.parent_id === definition.parent_id) {
+        this.registerManagedChannel(channel.id, channel.name ?? "", definition.kind, dateJst);
       }
     }
     return this.registeredChannels();
@@ -941,7 +985,11 @@ export class NightCoordinator {
     for (const item of queue) {
       const channel = remoteById.get(item.channel_id);
       const remoteKind = channel
-        ? classifyManagedChannel(channel, this.env.DISCORD_PARENT_CATEGORY_ID)
+        ? classifyManagedChannel(
+          channel,
+          this.env.DISCORD_PARENT_CATEGORY_ID,
+          this.env.DISCORD_DEEP_PARENT_CATEGORY_ID,
+        )
         : null;
       if (
         !channel ||
@@ -1024,9 +1072,12 @@ export class NightCoordinator {
     }
 
     const storedResumeUrl = this.getState("gateway_resume_url");
-    const url = this.gatewayIdentifyOnly
-      ? initialGatewayUrl()
-      : storedResumeUrl || initialGatewayUrl();
+    const normalizedResumeUrl = storedResumeUrl
+      ? normalizeGatewayUrl(storedResumeUrl)
+      : null;
+    const url = !this.gatewayIdentifyOnly && normalizedResumeUrl
+      ? normalizedResumeUrl
+      : initialGatewayUrl();
 
     try {
       const socket = new WebSocket(url);
@@ -1191,9 +1242,12 @@ export class NightCoordinator {
       if (ready.session_id) {
         this.setState("gateway_session_id", ready.session_id);
       }
-      if (ready.resume_gateway_url) {
-        this.setState("gateway_resume_url", ready.resume_gateway_url);
-      }
+      this.setState(
+        "gateway_resume_url",
+        ready.resume_gateway_url
+          ? normalizeGatewayUrl(ready.resume_gateway_url) ?? ""
+          : "",
+      );
       if (ready.user?.id) {
         this.setState("gateway_bot_user_id", ready.user.id);
       }
@@ -1530,6 +1584,9 @@ export class NightCoordinator {
         endedAt: cutoff,
         muted: session.muted === 1,
       }, dateJst);
+      // 全セッションを最後にまとめて消すと、後続セッションの失敗時に
+      // 成功済み分を再度加算するため、確定した利用者から順に消す。
+      this.deleteActiveSession(session.user_id);
     }
     this.deleteActiveSessions(dateJst);
   }

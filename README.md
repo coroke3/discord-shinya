@@ -44,6 +44,8 @@ CronはUTC基準の1本です。
 深層-深夜限定通話2-MM-DD 4人
 ```
 
+通常6チャンネルは`DISCORD_PARENT_CATEGORY_ID`、深層4チャンネルは`DISCORD_DEEP_PARENT_CATEGORY_ID`の別カテゴリに作成します。
+
 告知は`深夜限定テキスト1-MM-DD`と`深層-深夜限定テキスト1-MM-DD`へ、それぞれ一度ずつ投稿します。
 
 ```text
@@ -123,6 +125,7 @@ Gatewayの件数が`degraded`のときは、内訳のメッセージ数欄とメ
 DISCORD_BOT_TOKEN=
 DISCORD_GUILD_ID=
 DISCORD_PARENT_CATEGORY_ID=
+DISCORD_DEEP_PARENT_CATEGORY_ID=
 DISCORD_MENTION_ROLE_ID=
 DISCORD_DEEP_ROLE_ID=
 DISCORD_ACTIVITY_DETAIL_CHANNEL_ID=
@@ -135,12 +138,13 @@ DRY_RUN=false
 npm.cmd exec wrangler -- secret put DISCORD_BOT_TOKEN
 npm.cmd exec wrangler -- secret put DISCORD_GUILD_ID
 npm.cmd exec wrangler -- secret put DISCORD_PARENT_CATEGORY_ID
+npm.cmd exec wrangler -- secret put DISCORD_DEEP_PARENT_CATEGORY_ID
 npm.cmd exec wrangler -- secret put DISCORD_MENTION_ROLE_ID
 npm.cmd exec wrangler -- secret put DISCORD_DEEP_ROLE_ID
 npm.cmd exec wrangler -- secret put DISCORD_ACTIVITY_DETAIL_CHANNEL_ID
 ```
 
-6つの必須Secretが欠けている場合、`/health`は503になり、Cronは失敗閉じになります。TokenやDiscord APIのレスポンス本文はログに出しません。
+7つの必須Secretが欠けている場合、`/health`は503になり、Cronは失敗閉じになります。TokenやDiscord APIのレスポンス本文はログに出しません。
 
 ## Discord権限
 
@@ -153,7 +157,7 @@ Botには少なくとも次を付与してください。
 - Connect / Speak
 - Manage Roles（深層ロールを操作するため）
 
-Botのロールは`DISCORD_DEEP_ROLE_ID`のロールより上に置き、Bot自身が親カテゴリと内訳・ログチャンネルを閲覧・送信できるようにしてください。内訳チャンネルは`DISCORD_ACTIVITY_DETAIL_CHANNEL_ID`で指定し、BotのView Channels / Send Messagesを事前に許可します。
+`DISCORD_PARENT_CATEGORY_ID`には通常6チャンネル用カテゴリ、`DISCORD_DEEP_PARENT_CATEGORY_ID`には深層4チャンネル用に分離したカテゴリを指定してください。2つは別のカテゴリIDにします。Botのロールは`DISCORD_DEEP_ROLE_ID`のロールより上に置き、Bot自身が両方の親カテゴリと内訳・ログチャンネルを閲覧・送信できるようにしてください。内訳チャンネルは`DISCORD_ACTIVITY_DETAIL_CHANNEL_ID`で指定し、BotのView Channels / Send Messagesを事前に許可します。
 
 深層ロールは、00:00〜03:00は深層4チャンネルだけ閲覧可能です。03:00〜08:00は深層4チャンネルを`@everyone`にも公開しますが、通常6チャンネル側の深層ロール拒否は維持します。管理対象テキストチャンネルでは公開・非公開スレッド作成を拒否します。
 
@@ -167,7 +171,7 @@ GUILDS | GUILD_VOICE_STATES | GUILD_MESSAGES = 641
 
 ## 安全策と再試行
 
-- 管理対象は指定カテゴリ配下かつ厳密な日付付き名前だけです。カテゴリが違うチャンネルは削除しません。旧形式の単一テキスト・通話名も安全な範囲でクリーンアップ対象にします。
+- 管理対象は通常カテゴリまたは深層カテゴリ配下かつ厳密な日付付き名前だけです。別カテゴリのチャンネルは削除しません。カテゴリ分離前に通常カテゴリへ残った深層チャンネルだけは、移行時の一度の掃除対象にします。旧形式の単一テキスト・通話名も安全な範囲でクリーンアップ対象にします。
 - 00:00はGateway READY前に新規チャンネルを公開しません。作成途中の失敗は作成済み分をロールバックします。
 - 08:00の処理はDurable ObjectのSQLiteに段階を保存します。429の`Retry-After`を上限で丸めず、長いsleepをせず、次のDurable Object Alarmへ処理を移します。
 - Alarmは1つだけ使い、最も早い期限を保存します。ロール変更は1回最大20件です。

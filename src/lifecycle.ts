@@ -31,6 +31,7 @@ export async function openNightChannels(env: Env, scheduledTime: number): Promis
     env.DISCORD_GUILD_ID,
     env.DISCORD_DEEP_ROLE_ID,
     env.DISCORD_PARENT_CATEGORY_ID,
+    env.DISCORD_DEEP_PARENT_CATEGORY_ID,
   );
 
   if (isDryRun(env)) {
@@ -96,7 +97,11 @@ export async function closeNightChannels(env: Env): Promise<void> {
 export async function getManagedChannels(env: Env): Promise<DiscordChannel[]> {
   const channels = await listGuildChannels(env);
   return channels.filter((channel) =>
-    classifyManagedChannel(channel, env.DISCORD_PARENT_CATEGORY_ID) !== null,
+    classifyManagedChannel(
+      channel,
+      env.DISCORD_PARENT_CATEGORY_ID,
+      env.DISCORD_DEEP_PARENT_CATEGORY_ID,
+    ) !== null,
   );
 }
 

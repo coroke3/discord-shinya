@@ -5,6 +5,7 @@ import {
   createTextMessage,
   DiscordApiError,
   DiscordRateLimitError,
+  normalizeGatewayUrl,
 } from "../src/discord";
 import type { Env } from "../src/config";
 
@@ -12,6 +13,7 @@ const liveTestEnv: Env = {
   DISCORD_BOT_TOKEN: "test-token",
   DISCORD_GUILD_ID: "123456789012345678",
   DISCORD_PARENT_CATEGORY_ID: "234567890123456789",
+  DISCORD_DEEP_PARENT_CATEGORY_ID: "987654321098765432",
   DISCORD_MENTION_ROLE_ID: "345678901234567890",
   DISCORD_DEEP_ROLE_ID: "456789012345678901",
   DISCORD_ACTIVITY_DETAIL_CHANNEL_ID: "567890123456789012",
@@ -28,6 +30,16 @@ afterEach(() => {
 });
 
 describe("破壊的操作の安全策", () => {
+  it("RESUME用Gateway URLにAPIバージョンとJSON形式を付ける", () => {
+    const normalized = normalizeGatewayUrl("wss://gateway.example.test/?v=9&encoding=etf");
+    expect(normalized).not.toBeNull();
+    const url = new URL(normalized ?? "wss://invalid.example.test");
+    expect(url.protocol).toBe("wss:");
+    expect(url.searchParams.get("v")).toBe("10");
+    expect(url.searchParams.get("encoding")).toBe("json");
+    expect(normalizeGatewayUrl("https://gateway.example.test")).toBeNull();
+  });
+
   it("DRY_RUNではDiscord APIを一切呼ばない", async () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch");
 
@@ -61,7 +73,7 @@ describe("破壊的操作の安全策", () => {
               id,
               name: channel.name,
               type: channel.type,
-              parent_id: liveTestEnv.DISCORD_PARENT_CATEGORY_ID,
+              parent_id: channel.parent_id,
             }),
             { status: 201, headers: { "Content-Type": "application/json" } },
           );
@@ -125,7 +137,9 @@ describe("破壊的操作の安全策", () => {
                   : index < 8
                     ? `深層-深夜限定テキスト${index - 5}-08-30`
                     : `深層-深夜限定通話${index - 7}-08-30`,
-              parent_id: liveTestEnv.DISCORD_PARENT_CATEGORY_ID,
+              parent_id: index >= 6
+                ? liveTestEnv.DISCORD_DEEP_PARENT_CATEGORY_ID
+                : liveTestEnv.DISCORD_PARENT_CATEGORY_ID,
             }))),
             { status: 200 },
           );

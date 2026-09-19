@@ -36,6 +36,7 @@ export interface Env {
   DISCORD_BOT_TOKEN: string;
   DISCORD_GUILD_ID: string;
   DISCORD_PARENT_CATEGORY_ID: string;
+  DISCORD_DEEP_PARENT_CATEGORY_ID: string;
   DISCORD_MENTION_ROLE_ID: string;
   DISCORD_DEEP_ROLE_ID: string;
   DISCORD_ACTIVITY_DETAIL_CHANNEL_ID: string;
@@ -96,6 +97,7 @@ const REQUIRED_CONFIG_KEYS = [
   "DISCORD_BOT_TOKEN",
   "DISCORD_GUILD_ID",
   "DISCORD_PARENT_CATEGORY_ID",
+  "DISCORD_DEEP_PARENT_CATEGORY_ID",
   "DISCORD_MENTION_ROLE_ID",
   "DISCORD_DEEP_ROLE_ID",
   "DISCORD_ACTIVITY_DETAIL_CHANNEL_ID",
@@ -113,6 +115,7 @@ export function getConfigIssues(env: Partial<Env>): string[] {
   for (const key of [
     "DISCORD_GUILD_ID",
     "DISCORD_PARENT_CATEGORY_ID",
+    "DISCORD_DEEP_PARENT_CATEGORY_ID",
     "DISCORD_MENTION_ROLE_ID",
     "DISCORD_DEEP_ROLE_ID",
     "DISCORD_ACTIVITY_DETAIL_CHANNEL_ID",
@@ -121,6 +124,16 @@ export function getConfigIssues(env: Partial<Env>): string[] {
     if (value && !/^\d+$/.test(value)) {
       issues.push(`${key} must be a Discord snowflake`);
     }
+  }
+
+  const normalParentCategoryId = env.DISCORD_PARENT_CATEGORY_ID?.trim();
+  const deepParentCategoryId = env.DISCORD_DEEP_PARENT_CATEGORY_ID?.trim();
+  if (
+    normalParentCategoryId &&
+    deepParentCategoryId &&
+    normalParentCategoryId === deepParentCategoryId
+  ) {
+    issues.push("DISCORD_DEEP_PARENT_CATEGORY_ID must differ from DISCORD_PARENT_CATEGORY_ID");
   }
 
   return issues;
@@ -197,6 +210,7 @@ export function channelDefinitions(
   guildId: string,
   deepRoleId: string,
   parentCategoryId = "",
+  deepParentCategoryId = parentCategoryId,
   botUserId?: string,
 ): ChannelDefinition[] {
   const names = channelNames(dateKey);
@@ -226,7 +240,7 @@ export function channelDefinitions(
       name,
       type: 0,
       kind: "deep_text",
-      parent_id: parentCategoryId,
+      parent_id: deepParentCategoryId,
       permission_overwrites: deepOverwrites(guildId, deepRoleId, botUserId),
     });
   });
@@ -235,7 +249,7 @@ export function channelDefinitions(
       name,
       type: 2,
       kind: "deep_voice",
-      parent_id: parentCategoryId,
+      parent_id: deepParentCategoryId,
       permission_overwrites: deepOverwrites(guildId, deepRoleId, botUserId),
       user_limit: [0, 4][index],
     });
@@ -401,34 +415,37 @@ function messageGraph(messageCount: number, messageCountAvailable: boolean): str
 export function classifyManagedChannel(
   channel: DiscordChannel,
   parentCategoryId: string,
+  deepParentCategoryId = parentCategoryId,
 ): ManagedChannelKind | null {
-  if (channel.parent_id !== parentCategoryId) {
-    return null;
-  }
-
   const name = channel.name ?? "";
   if (channel.type === 0) {
     if (new RegExp(`^${escapeRegExp(TEXT_CHANNEL_PREFIX)}[123]-\\d{2}-\\d{2}$`).test(name)) {
-      return "normal_text";
+      return channel.parent_id === parentCategoryId ? "normal_text" : null;
     }
     if (new RegExp(`^${escapeRegExp(DEEP_CHANNEL_PREFIX + TEXT_CHANNEL_PREFIX)}[12]-\\d{2}-\\d{2}$`).test(name)) {
-      return "deep_text";
+      // 深層カテゴリ分離前に通常カテゴリへ作られた旧チャンネルは、
+      // 初回の移行掃除だけが安全に回収できるよう残存管理対象とする。
+      return channel.parent_id === deepParentCategoryId || channel.parent_id === parentCategoryId
+        ? "deep_text"
+        : null;
     }
     if (new RegExp(`^${escapeRegExp(LEGACY_TEXT_CHANNEL_PREFIX)}\\d{2}-\\d{2}$`).test(name)) {
-      return "normal_text";
+      return channel.parent_id === parentCategoryId ? "normal_text" : null;
     }
     return null;
   }
 
   if (channel.type === 2) {
     if (new RegExp(`^${escapeRegExp(VOICE_CHANNEL_PREFIX)}[123]-\\d{2}-\\d{2}$`).test(name)) {
-      return "normal_voice";
+      return channel.parent_id === parentCategoryId ? "normal_voice" : null;
     }
     if (new RegExp(`^${escapeRegExp(DEEP_CHANNEL_PREFIX + VOICE_CHANNEL_PREFIX)}[12]-\\d{2}-\\d{2}$`).test(name)) {
-      return "deep_voice";
+      return channel.parent_id === deepParentCategoryId || channel.parent_id === parentCategoryId
+        ? "deep_voice"
+        : null;
     }
     if (new RegExp(`^${escapeRegExp(LEGACY_VOICE_CHANNEL_PREFIX)}\\d{2}-\\d{2}$`).test(name)) {
-      return "normal_voice";
+      return channel.parent_id === parentCategoryId ? "normal_voice" : null;
     }
   }
 
@@ -438,17 +455,26 @@ export function classifyManagedChannel(
 export function isManagedChannel(
   channel: DiscordChannel,
   parentCategoryId: string,
+  deepParentCategoryId = parentCategoryId,
 ): boolean {
-  return classifyManagedChannel(channel, parentCategoryId) !== null;
+  return classifyManagedChannel(channel, parentCategoryId, deepParentCategoryId) !== null;
 }
 
-export function isManagedTextChannel(channel: DiscordChannel, parentCategoryId: string): boolean {
-  const kind = classifyManagedChannel(channel, parentCategoryId);
+export function isManagedTextChannel(
+  channel: DiscordChannel,
+  parentCategoryId: string,
+  deepParentCategoryId = parentCategoryId,
+): boolean {
+  const kind = classifyManagedChannel(channel, parentCategoryId, deepParentCategoryId);
   return kind === "normal_text" || kind === "deep_text";
 }
 
-export function isManagedVoiceChannel(channel: DiscordChannel, parentCategoryId: string): boolean {
-  const kind = classifyManagedChannel(channel, parentCategoryId);
+export function isManagedVoiceChannel(
+  channel: DiscordChannel,
+  parentCategoryId: string,
+  deepParentCategoryId = parentCategoryId,
+): boolean {
+  const kind = classifyManagedChannel(channel, parentCategoryId, deepParentCategoryId);
   return kind === "normal_voice" || kind === "deep_voice";
 }
 

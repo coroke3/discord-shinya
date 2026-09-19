@@ -139,6 +139,24 @@ export function initialGatewayUrl(): string {
   return "wss://gateway.discord.gg/?v=10&encoding=json";
 }
 
+/**
+ * DiscordがREADYで返すRESUME用URLにも、接続時と同じバージョン・形式を
+ * 必ず付ける。異常な値は保存・接続に使わず、初期Gatewayへフォールバックする。
+ */
+export function normalizeGatewayUrl(value: string): string | null {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "wss:" || !url.hostname) {
+      return null;
+    }
+    url.searchParams.set("v", "10");
+    url.searchParams.set("encoding", "json");
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
 async function discordRequest<T>(
   env: Env,
   path: string,
