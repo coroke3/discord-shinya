@@ -35,6 +35,19 @@ export function japanNightEndMs(dateJst: string): number {
   return japanDayStartMs(dateJst) + NIGHT_END_HOUR_JST * 60 * MINUTE_MS;
 }
 
+/**
+ * Returns the 30-minute bucket for a received event, or null outside the
+ * 00:00-08:00 JST window.
+ */
+export function activityBucketIndexAt(dateJst: string, timestampMs: number): number | null {
+  const offset = timestampMs - japanDayStartMs(dateJst);
+  const bucketIndex = Math.floor(offset / HALF_HOUR_MS);
+  if (bucketIndex < 0 || bucketIndex >= ACTIVITY_BUCKET_COUNT) {
+    return null;
+  }
+  return bucketIndex;
+}
+
 export function isUnmutedVoiceState(selfMute: unknown, mute: unknown): boolean {
   return selfMute === false && mute === false;
 }

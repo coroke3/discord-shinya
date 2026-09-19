@@ -81,12 +81,40 @@ describe("新しい深夜チャンネル構成", () => {
 
   it("30分内訳を匿名の集計値だけで出力する", () => {
     const report = buildDetailReport("2026-08-29", [
-      { index: 0, totalVoiceMs: 10_000, mutedVoiceMs: 2_500, uniqueUsers: 3 },
+      {
+        index: 0,
+        totalVoiceMs: 10_000,
+        mutedVoiceMs: 2_500,
+        uniqueUsers: 3,
+        mutedUsers: 1,
+        messageCount: 41,
+      },
+      {
+        index: 1,
+        totalVoiceMs: 0,
+        mutedVoiceMs: 0,
+        uniqueUsers: 2,
+        mutedUsers: 0,
+        messageCount: 20,
+      },
     ]);
     expect(report).toContain("【賑わい内訳 08/29】");
-    expect(report).toContain("00:00-00:29 | 3人 | 25.0%");
+    expect(report).toContain("時間帯 | 滞在人数 | ミュート率 | メッセージ数");
+    expect(report).toContain("00:00-00:29 | 3人 | 1/3 | 41件");
+    expect(report).not.toContain("25.0%");
+    expect(report).toContain("【滞在人数グラフ】");
+    expect(report).toContain("00:00-00:29 | ■■□");
+    expect(report).toContain("【メッセージ数グラフ】");
+    expect(report).toContain("00:00-00:29 | ■■■");
+    expect(report).toContain("00:30-00:59 | ■");
+    expect(report).toContain("■=ミュートなしの1人、□=枠内にミュート状態があった1人");
+    expect(report).toContain("20件につき■1つ");
     expect(report).not.toContain("user");
     expect(report.length).toBeLessThan(2000);
+
+    const degradedReport = buildDetailReport("2026-08-29", [], false);
+    expect(degradedReport).toContain("00:00-00:29 | 0人 | 0/0 | 取得不可");
+    expect(degradedReport).toContain("00:00-00:29 | 取得不可");
   });
 
   it("新しいSecretが欠けている場合は値をログに出さずに報告する", () => {

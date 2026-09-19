@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { closeNightChannels, openNightChannels } from "../src/lifecycle";
-import { createTextMessage, DiscordRateLimitError } from "../src/discord";
+import {
+  createGuildChannel,
+  createTextMessage,
+  DiscordApiError,
+  DiscordRateLimitError,
+} from "../src/discord";
 import type { Env } from "../src/config";
 
 const liveTestEnv: Env = {
@@ -32,7 +37,7 @@ describe("破壊的操作の安全策", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it("10チャンネルを作り、深夜限定テキスト1へ一度だけ告知する", async () => {
+  it("10チャンネルを作り、通常テキスト1と深層テキスト1へ一度ずつ告知する", async () => {
     const requests: Array<{ method: string; url: string; body?: string }> = [];
     let createdChannelNumber = 0;
 
@@ -61,7 +66,7 @@ describe("破壊的操作の安全策", () => {
             { status: 201, headers: { "Content-Type": "application/json" } },
           );
         }
-        if (method === "POST" && url.includes("/channels/created-channel-0/messages")) {
+        if (method === "POST" && url.includes("/messages")) {
           return new Response(null, { status: 204 });
         }
         throw new Error(`Unexpected request: ${method} ${url}`);
@@ -89,8 +94,14 @@ describe("破壊的操作の安全策", () => {
     ]);
     expect(JSON.parse(channelCreates[4]?.body ?? "{}").user_limit).toBe(8);
     expect(JSON.parse(channelCreates[8]?.body ?? "{}").user_limit).toBe(0);
-    expect(requests.filter((request) => request.method === "POST" && request.url.includes("/messages")))
-      .toHaveLength(1);
+    const announcements = requests.filter(
+      (request) => request.method === "POST" && request.url.includes("/messages"),
+    );
+    expect(announcements).toHaveLength(2);
+    expect(announcements.map((request) => request.url)).toEqual([
+      expect.stringContaining("/channels/created-channel-0/messages"),
+      expect.stringContaining("/channels/created-channel-6/messages"),
+    ]);
     expect(requests.some((request) => request.method === "DELETE")).toBe(false);
   });
 
@@ -145,5 +156,19 @@ describe("破壊的操作の安全策", () => {
       .rejects.toSatisfy((error: unknown) =>
         error instanceof DiscordRateLimitError && error.retryAfterMs === 61_500,
       );
+  });
+
+  it("チャンネル作成POSTの5xxを自動再送して二重作成しない", async () => {
+    const fetchSpy = vi.fn(async () => new Response(null, { status: 502 }));
+    vi.stubGlobal("fetch", fetchSpy);
+
+    await expect(createGuildChannel(liveTestEnv, {
+      name: "深夜限定テキスト1-08-30",
+      type: 0,
+      parent_id: liveTestEnv.DISCORD_PARENT_CATEGORY_ID,
+    })).rejects.toSatisfy((error: unknown) =>
+      error instanceof DiscordApiError && error.status === 502,
+    );
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 });

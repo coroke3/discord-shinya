@@ -171,14 +171,22 @@ async function discordRequest<T>(
     );
   }
 
-  if (response.status >= 500 && attempt < MAX_RETRIES) {
+  // POSTはDiscord側で処理済みなのに応答だけ5xxになると、再送で
+  // チャンネルやメッセージを二重作成し得る。上位処理が状態を再照合して
+  // 再試行するため、ここでは冪等なメソッドだけを自動再送する。
+  const method = (init.method ?? "GET").toUpperCase();
+  if (response.status >= 500 && isRetryableMethod(method) && attempt < MAX_RETRIES) {
     await sleep(250 * 2 ** attempt);
     return discordRequest<T>(env, path, init, attempt + 1);
   }
 
   // Do not include Discord's response body: it is unnecessary for operation
   // and avoids accidentally writing remote data into Worker logs.
-  throw new DiscordApiError(response.status, init.method ?? "GET", path);
+  throw new DiscordApiError(response.status, method, path);
+}
+
+function isRetryableMethod(method: string): boolean {
+  return method === "GET" || method === "PUT" || method === "DELETE";
 }
 
 function parseRetryAfterMs(response: Response): number {

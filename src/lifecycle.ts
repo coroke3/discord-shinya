@@ -47,13 +47,21 @@ export async function openNightChannels(env: Env, scheduledTime: number): Promis
       const channel = await createGuildChannel(env, payload);
       created.push(channel);
     }
-    const firstText = created.find((channel) => channel.type === 0);
-    if (!firstText) {
-      throw new Error("No text channel was created for the announcement");
+    const firstTextDefinition = definitions.find((definition) => definition.kind === "normal_text");
+    const firstDeepTextDefinition = definitions.find((definition) => definition.kind === "deep_text");
+    const firstText = created.find((channel) => channel.name === firstTextDefinition?.name);
+    const firstDeepText = created.find((channel) => channel.name === firstDeepTextDefinition?.name);
+    if (!firstText || !firstDeepText) {
+      throw new Error("Required text channels were not created for the announcement");
     }
     await createAnnouncement(
       env,
       firstText.id,
+      buildAnnouncementPayload(env.DISCORD_MENTION_ROLE_ID),
+    );
+    await createAnnouncement(
+      env,
+      firstDeepText.id,
       buildAnnouncementPayload(env.DISCORD_MENTION_ROLE_ID),
     );
   } catch (error) {

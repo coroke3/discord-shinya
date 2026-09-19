@@ -88,6 +88,8 @@ export interface ActivityBucket {
   totalVoiceMs: number;
   mutedVoiceMs: number;
   uniqueUsers: number;
+  mutedUsers: number;
+  messageCount: number;
 }
 
 const REQUIRED_CONFIG_KEYS = [
@@ -305,29 +307,95 @@ export function buildAnnouncementPayload(roleId: string): {
 export function buildDetailReport(
   dateJst: string,
   buckets: readonly ActivityBucket[],
+  messageCountAvailable = true,
 ): string {
   const label = dateJst.length >= 7
     ? `${dateJst.slice(5, 7)}/${dateJst.slice(8, 10)}`
     : dateJst.replace("-", "/");
-  const lines = [`【賑わい内訳 ${label}】`, "", "時間帯 | 滞在人数 | ミュート率"];
+  const lines = [`【賑わい内訳 ${label}】`, "", "時間帯 | 滞在人数 | ミュート率 | メッセージ数"];
 
   for (let index = 0; index < ACTIVITY_BUCKET_COUNT; index += 1) {
     const bucket = buckets.find((candidate) => candidate.index === index);
-    const total = bucket?.totalVoiceMs ?? 0;
-    const muted = bucket?.mutedVoiceMs ?? 0;
-    const ratio = total > 0 ? (muted / total) * 100 : 0;
+    const uniqueUsers = Math.max(0, Math.floor(bucket?.uniqueUsers ?? 0));
+    const mutedUsers = Math.min(
+      uniqueUsers,
+      Math.max(0, Math.floor(bucket?.mutedUsers ?? 0)),
+    );
+    const messageCount = Math.max(0, Math.floor(bucket?.messageCount ?? 0));
+    const messageLabel = messageCountAvailable ? `${messageCount}件` : "取得不可";
     const startMinutes = index * ACTIVITY_BUCKET_MINUTES;
     const endMinutes = startMinutes + ACTIVITY_BUCKET_MINUTES - 1;
     lines.push(
-      `${formatClock(startMinutes)}-${formatClock(endMinutes)} | ${bucket?.uniqueUsers ?? 0}人 | ${ratio.toFixed(1)}%`,
+      `${formatClock(startMinutes)}-${formatClock(endMinutes)} | ${uniqueUsers}人 | ${mutedUsers}/${uniqueUsers} | ${messageLabel}`,
     );
   }
+
+  lines.push("", "【滞在人数グラフ】");
+  for (let index = 0; index < ACTIVITY_BUCKET_COUNT; index += 1) {
+    const bucket = buckets.find((candidate) => candidate.index === index);
+    const uniqueUsers = Math.max(0, Math.floor(bucket?.uniqueUsers ?? 0));
+    const mutedUsers = Math.min(
+      uniqueUsers,
+      Math.max(0, Math.floor(bucket?.mutedUsers ?? 0)),
+    );
+    const startMinutes = index * ACTIVITY_BUCKET_MINUTES;
+    const endMinutes = startMinutes + ACTIVITY_BUCKET_MINUTES - 1;
+    lines.push(
+      `${formatClock(startMinutes)}-${formatClock(endMinutes)} | ${personGraph(uniqueUsers, mutedUsers)}`,
+    );
+  }
+
+  lines.push("", "【メッセージ数グラフ】");
+  for (let index = 0; index < ACTIVITY_BUCKET_COUNT; index += 1) {
+    const bucket = buckets.find((candidate) => candidate.index === index);
+    const messageCount = Math.max(0, Math.floor(bucket?.messageCount ?? 0));
+    const startMinutes = index * ACTIVITY_BUCKET_MINUTES;
+    const endMinutes = startMinutes + ACTIVITY_BUCKET_MINUTES - 1;
+    lines.push(
+      `${formatClock(startMinutes)}-${formatClock(endMinutes)} | ${messageGraph(messageCount, messageCountAvailable)}`,
+    );
+  }
+
+  lines.push(
+    "",
+    "※滞在人数グラフは■=ミュートなしの1人、□=枠内にミュート状態があった1人です。",
+    "※メッセージ数グラフは20件につき■1つです。長すぎる場合は末尾を…で省略します。",
+  );
 
   const report = lines.join("\n");
   if (report.length > 2000) {
     throw new Error("Activity detail report exceeds Discord's 2000-character limit");
   }
   return report;
+}
+
+const MAX_GRAPH_SYMBOLS_PER_ROW = 20;
+
+function personGraph(uniqueUsers: number, mutedUsers: number): string {
+  if (uniqueUsers === 0) {
+    return "（なし）";
+  }
+
+  const unmutedUsers = Math.max(0, uniqueUsers - mutedUsers);
+  const visibleUnmuted = Math.min(unmutedUsers, MAX_GRAPH_SYMBOLS_PER_ROW);
+  const remaining = MAX_GRAPH_SYMBOLS_PER_ROW - visibleUnmuted;
+  const visibleMuted = Math.min(mutedUsers, remaining);
+  const graph = "■".repeat(visibleUnmuted) + "□".repeat(visibleMuted);
+  return uniqueUsers > graph.length ? `${graph}…` : graph;
+}
+
+function messageGraph(messageCount: number, messageCountAvailable: boolean): string {
+  if (!messageCountAvailable) {
+    return "取得不可";
+  }
+  if (messageCount === 0) {
+    return "（なし）";
+  }
+
+  const units = Math.ceil(messageCount / 20);
+  const visibleUnits = Math.min(units, MAX_GRAPH_SYMBOLS_PER_ROW);
+  const graph = "■".repeat(visibleUnits);
+  return units > visibleUnits ? `${graph}…` : graph;
 }
 
 export function classifyManagedChannel(
@@ -469,5 +537,5 @@ function formatClock(totalMinutes: number): string {
 }
 
 function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&");
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
