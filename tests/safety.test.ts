@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { closeNightChannels, openNightChannels } from "../src/lifecycle";
-import { countChannelMessages } from "../src/discord";
+import { createTextMessage, DiscordRateLimitError } from "../src/discord";
 import type { Env } from "../src/config";
 
 const liveTestEnv: Env = {
@@ -8,13 +8,12 @@ const liveTestEnv: Env = {
   DISCORD_GUILD_ID: "123456789012345678",
   DISCORD_PARENT_CATEGORY_ID: "234567890123456789",
   DISCORD_MENTION_ROLE_ID: "345678901234567890",
+  DISCORD_DEEP_ROLE_ID: "456789012345678901",
+  DISCORD_ACTIVITY_DETAIL_CHANNEL_ID: "567890123456789012",
 };
 
 const dryRunEnv: Env = {
-  DISCORD_BOT_TOKEN: "test-token",
-  DISCORD_GUILD_ID: "123456789012345678",
-  DISCORD_PARENT_CATEGORY_ID: "234567890123456789",
-  DISCORD_MENTION_ROLE_ID: "345678901234567890",
+  ...liveTestEnv,
   DRY_RUN: "true",
 };
 
@@ -23,8 +22,8 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("safe test behavior", () => {
-  it("does not call Discord at all in dry-run scheduled operations", async () => {
+describe("破壊的操作の安全策", () => {
+  it("DRY_RUNではDiscord APIを一切呼ばない", async () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch");
 
     await openNightChannels(dryRunEnv, Date.UTC(2026, 7, 30, 15, 0));
@@ -33,35 +32,7 @@ describe("safe test behavior", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it("counts paginated messages using GET requests only", async () => {
-    const requests: Array<{ method: string; url: string }> = [];
-    const pages = [
-      Array.from({ length: 100 }, (_, index) => ({ id: String(1000 - index) })),
-      [{ id: "1" }],
-    ];
-
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        requests.push({
-          method: init?.method ?? "GET",
-          url: String(input),
-        });
-        return new Response(JSON.stringify(pages.shift() ?? []), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      }),
-    );
-
-    await expect(countChannelMessages(dryRunEnv, "456789012345678901")).resolves.toBe(101);
-    expect(requests).toHaveLength(2);
-    expect(requests.map((request) => request.method)).toEqual(["GET", "GET"]);
-    expect(requests[1]?.url).toContain("before=901");
-    expect(requests.some((request) => request.method === "DELETE")).toBe(false);
-  });
-
-  it("creates two text and two voice channels and announces in text channel 1", async () => {
+  it("10チャンネルを作り、深夜限定テキスト1へ一度だけ告知する", async () => {
     const requests: Array<{ method: string; url: string; body?: string }> = [];
     let createdChannelNumber = 0;
 
@@ -76,7 +47,6 @@ describe("safe test behavior", () => {
         if (method === "GET" && url.endsWith(`/guilds/${liveTestEnv.DISCORD_GUILD_ID}/channels`)) {
           return new Response("[]", { status: 200 });
         }
-
         if (method === "POST" && url.endsWith(`/guilds/${liveTestEnv.DISCORD_GUILD_ID}/channels`)) {
           const channel = JSON.parse(body ?? "{}");
           const id = `created-channel-${createdChannelNumber}`;
@@ -91,11 +61,9 @@ describe("safe test behavior", () => {
             { status: 201, headers: { "Content-Type": "application/json" } },
           );
         }
-
         if (method === "POST" && url.includes("/channels/created-channel-0/messages")) {
           return new Response(null, { status: 204 });
         }
-
         throw new Error(`Unexpected request: ${method} ${url}`);
       }),
     );
@@ -103,191 +71,79 @@ describe("safe test behavior", () => {
     await openNightChannels(liveTestEnv, Date.UTC(2026, 7, 30, 15, 0));
 
     const channelCreates = requests.filter(
-      (request) =>
-        request.method === "POST" &&
+      (request) => request.method === "POST" &&
         request.url.endsWith(`/guilds/${liveTestEnv.DISCORD_GUILD_ID}/channels`),
     );
-    expect(channelCreates.map((request) => JSON.parse(request.body ?? "{}")).map((body) => body.name)).toEqual([
+    expect(channelCreates).toHaveLength(10);
+    expect(channelCreates.map((request) => JSON.parse(request.body ?? "{}").name)).toEqual([
       "深夜限定テキスト1-08-31",
       "深夜限定テキスト2-08-31",
+      "深夜限定テキスト3-08-31",
       "深夜限定通話1-08-31",
       "深夜限定通話2-08-31",
+      "深夜限定通話3-08-31",
+      "深層-深夜限定テキスト1-08-31",
+      "深層-深夜限定テキスト2-08-31",
+      "深層-深夜限定通話1-08-31",
+      "深層-深夜限定通話2-08-31",
     ]);
-    expect(channelCreates.map((request) => JSON.parse(request.body ?? "{}")).map((body) => body.type)).toEqual([
-      0,
-      0,
-      2,
-      2,
-    ]);
-
-    const announcements = requests.filter(
-      (request) =>
-        request.method === "POST" &&
-        request.url.includes("/channels/created-channel-0/messages"),
-    );
-    expect(announcements).toHaveLength(1);
-    expect(JSON.parse(announcements[0]?.body ?? "{}").content).toContain(
-      "今日のチャンネルが作成されました！",
-    );
+    expect(JSON.parse(channelCreates[4]?.body ?? "{}").user_limit).toBe(8);
+    expect(JSON.parse(channelCreates[8]?.body ?? "{}").user_limit).toBe(0);
+    expect(requests.filter((request) => request.method === "POST" && request.url.includes("/messages")))
+      .toHaveLength(1);
     expect(requests.some((request) => request.method === "DELETE")).toBe(false);
   });
 
-  it("logs the combined message count from both text channels", async () => {
+  it("終了時も履歴APIを呼ばず、ログ投稿後に10チャンネルを削除する", async () => {
     const requests: Array<{ method: string; url: string; body?: string }> = [];
-
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const method = init?.method ?? "GET";
         const url = String(input);
-        const body = typeof init?.body === "string" ? init.body : undefined;
-        requests.push({ method, url, body });
-
-        if (method === "GET" && url.endsWith(`/guilds/${liveTestEnv.DISCORD_GUILD_ID}/channels`)) {
+        requests.push({ method, url, body: typeof init?.body === "string" ? init.body : undefined });
+        if (method === "GET") {
           return new Response(
-            JSON.stringify([
-              {
-                id: "night-text-1-id",
-                name: "深夜限定テキスト1-08-30",
-                type: 0,
-                parent_id: liveTestEnv.DISCORD_PARENT_CATEGORY_ID,
-              },
-              {
-                id: "night-text-2-id",
-                name: "深夜限定テキスト2-08-30",
-                type: 0,
-                parent_id: liveTestEnv.DISCORD_PARENT_CATEGORY_ID,
-              },
-              {
-                id: "night-voice-1-id",
-                name: "深夜限定通話1-08-30",
-                type: 2,
-                parent_id: liveTestEnv.DISCORD_PARENT_CATEGORY_ID,
-              },
-              {
-                id: "night-voice-2-id",
-                name: "深夜限定通話2-08-30",
-                type: 2,
-                parent_id: liveTestEnv.DISCORD_PARENT_CATEGORY_ID,
-              },
-            ]),
-            { status: 200, headers: { "Content-Type": "application/json" } },
+            JSON.stringify(Array.from({ length: 10 }, (_, index) => ({
+              id: `channel-${index}`,
+              type: index < 3 || index === 6 || index === 7 ? 0 : 2,
+              name: index < 3
+                ? `深夜限定テキスト${index + 1}-08-30`
+                : index < 6
+                  ? `深夜限定通話${index - 2}-08-30`
+                  : index < 8
+                    ? `深層-深夜限定テキスト${index - 5}-08-30`
+                    : `深層-深夜限定通話${index - 7}-08-30`,
+              parent_id: liveTestEnv.DISCORD_PARENT_CATEGORY_ID,
+            }))),
+            { status: 200 },
           );
         }
-
-        if (url.includes("/channels/night-text-1-id/messages?")) {
-          return new Response(JSON.stringify([{ id: "message-1" }, { id: "message-2" }]), {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          });
-        }
-
-        if (url.includes("/channels/night-text-2-id/messages?")) {
-          return new Response(JSON.stringify([{ id: "message-3" }]), {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          });
-        }
-
-        if (method === "POST" && url.includes("/channels/1543273845257928747/messages")) {
-          return new Response(null, { status: 204 });
-        }
-
-        if (method === "DELETE") {
-          return new Response(null, { status: 204 });
-        }
-
-        throw new Error(`Unexpected request: ${method} ${url}`);
+        return new Response(null, { status: 204 });
       }),
     );
 
     await closeNightChannels(liveTestEnv);
 
-    const logPosts = requests.filter(
-      (request) =>
-        request.method === "POST" &&
-        request.url.includes("/channels/1543273845257928747/messages"),
-    );
-    expect(logPosts).toHaveLength(1);
-    expect(JSON.parse(logPosts[0]?.body ?? "{}").content).toBe(
-      "今日のメッセージ数：3件\n今日もお疲れ様でした！おはようございます！",
-    );
-    expect(requests.filter((request) => request.method === "DELETE")).toHaveLength(4);
+    expect(requests.some((request) => request.method === "GET" && request.url.includes("/messages")))
+      .toBe(false);
+    expect(requests.filter((request) => request.method === "POST" && request.url.includes("/messages")))
+      .toHaveLength(1);
+    expect(requests.filter((request) => request.method === "DELETE")).toHaveLength(10);
   });
 
-  it("posts only the morning greeting when either message count fails", async () => {
-    const requests: Array<{ method: string; url: string; body?: string }> = [];
-
+  it("429のRetry-Afterを上限30秒に丸めず、Alarm用エラーとして返す", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const method = init?.method ?? "GET";
-        const url = String(input);
-        requests.push({
-          method,
-          url,
-          body: typeof init?.body === "string" ? init.body : undefined,
-        });
-
-        if (url.endsWith(`/guilds/${liveTestEnv.DISCORD_GUILD_ID}/channels`)) {
-          return new Response(
-            JSON.stringify([
-              {
-                id: "night-text-1-id",
-                name: "深夜限定テキスト1-08-30",
-                type: 0,
-                parent_id: liveTestEnv.DISCORD_PARENT_CATEGORY_ID,
-              },
-              {
-                id: "night-text-2-id",
-                name: "深夜限定テキスト2-08-30",
-                type: 0,
-                parent_id: liveTestEnv.DISCORD_PARENT_CATEGORY_ID,
-              },
-              {
-                id: "night-voice-1-id",
-                name: "深夜限定通話1-08-30",
-                type: 2,
-                parent_id: liveTestEnv.DISCORD_PARENT_CATEGORY_ID,
-              },
-              {
-                id: "night-voice-2-id",
-                name: "深夜限定通話2-08-30",
-                type: 2,
-                parent_id: liveTestEnv.DISCORD_PARENT_CATEGORY_ID,
-              },
-            ]),
-            { status: 200, headers: { "Content-Type": "application/json" } },
-          );
-        }
-
-        if (url.includes("/channels/night-text-1-id/messages?")) {
-          return new Response(JSON.stringify({ message: "Forbidden" }), { status: 403 });
-        }
-
-        if (url.includes("/channels/1543273845257928747/messages")) {
-          return new Response(null, { status: 204 });
-        }
-
-        if (method === "DELETE") {
-          return new Response(null, { status: 204 });
-        }
-
-        throw new Error(`Unexpected request: ${method} ${url}`);
-      }),
+      vi.fn(async () => new Response(null, {
+        status: 429,
+        headers: { "Retry-After": "61.5" },
+      })),
     );
 
-    await closeNightChannels(liveTestEnv);
-
-    const logPosts = requests.filter(
-      (request) =>
-        request.method === "POST" &&
-        request.url.includes("/channels/1543273845257928747/messages"),
-    );
-    expect(logPosts).toHaveLength(1);
-    expect(JSON.parse(logPosts[0]?.body ?? "{}").content).toBe(
-      "今日もお疲れ様でした！おはようございます！",
-    );
-    expect(requests.filter((request) => request.method === "DELETE")).toHaveLength(4);
+    await expect(createTextMessage(liveTestEnv, "123456789012345678", "test"))
+      .rejects.toSatisfy((error: unknown) =>
+        error instanceof DiscordRateLimitError && error.retryAfterMs === 61_500,
+      );
   });
 });

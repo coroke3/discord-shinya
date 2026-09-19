@@ -1,22 +1,53 @@
-// One Cron expression covers both daily boundaries, which keeps the Worker
-// within the account-level free-plan Cron trigger limit.
-export const NIGHT_CRON = "0 15,23 * * *";
+export const NIGHT_CRON = "0 15,18,23 * * *";
 export const OPEN_UTC_HOUR = 15;
+export const DEEP_OPEN_UTC_HOUR = 18;
 export const CLOSE_UTC_HOUR = 23;
 export const TIME_ZONE = "Asia/Tokyo";
 export const MESSAGE_LOG_CHANNEL_ID = "1543273845257928747";
+export const EXPECTED_CHANNEL_COUNT = 10;
+export const GATEWAY_INTENTS = 641;
+export const MAX_ROLE_OPERATIONS_PER_ALARM = 20;
+export const NIGHT_START_HOUR_JST = 0;
+export const DEEP_START_HOUR_JST = 3;
+export const NIGHT_END_HOUR_JST = 8;
+export const ACTIVITY_BUCKET_MINUTES = 30;
+export const ACTIVITY_BUCKET_COUNT =
+  ((NIGHT_END_HOUR_JST - NIGHT_START_HOUR_JST) * 60) / ACTIVITY_BUCKET_MINUTES;
+// Workers Freeの1回あたりsubrequest上限に余裕を残すため、削除は20件ずつ行う。
+// 残りの対象はDurable Object Alarmで次回へ引き継ぐ。
+export const MAX_CHANNEL_DELETE_OPERATIONS_PER_ALARM = 20;
 
 export const TEXT_CHANNEL_PREFIX = "深夜限定テキスト";
 export const VOICE_CHANNEL_PREFIX = "深夜限定通話";
+export const DEEP_CHANNEL_PREFIX = "深層-";
+
 const LEGACY_TEXT_CHANNEL_PREFIX = "深夜限定テキスト-";
 const LEGACY_VOICE_CHANNEL_PREFIX = "深夜限定通話-";
+
+export interface CoordinatorStub {
+  fetch(request: Request): Promise<Response>;
+}
+
+export interface CoordinatorNamespace {
+  getByName(name: string): CoordinatorStub;
+}
 
 export interface Env {
   DISCORD_BOT_TOKEN: string;
   DISCORD_GUILD_ID: string;
   DISCORD_PARENT_CATEGORY_ID: string;
   DISCORD_MENTION_ROLE_ID: string;
+  DISCORD_DEEP_ROLE_ID: string;
+  DISCORD_ACTIVITY_DETAIL_CHANNEL_ID: string;
+  NIGHT_COORDINATOR?: CoordinatorNamespace;
   DRY_RUN?: string;
+}
+
+export interface PermissionOverwrite {
+  id: string;
+  type: 0 | 1;
+  allow: string;
+  deny: string;
 }
 
 export interface DiscordChannel {
@@ -25,24 +56,47 @@ export interface DiscordChannel {
   type: number;
   parent_id?: string | null;
   guild_id?: string;
-}
-
-export interface DiscordMessage {
-  id: string;
+  permission_overwrites?: PermissionOverwrite[];
+  user_limit?: number;
 }
 
 export interface ChannelNames {
-  text: readonly [string, string];
-  voice: readonly [string, string];
+  text: readonly [string, string, string];
+  voice: readonly [string, string, string];
+  deepText: readonly [string, string];
+  deepVoice: readonly [string, string];
 }
 
-export type ScheduledOperation = "open" | "close" | null;
+export type ScheduledOperation = "open" | "open_deep" | "close" | null;
+export type ManagedChannelKind =
+  | "normal_text"
+  | "normal_voice"
+  | "deep_text"
+  | "deep_voice";
+
+export interface ChannelDefinition {
+  name: string;
+  type: 0 | 2;
+  kind: ManagedChannelKind;
+  parent_id: string;
+  permission_overwrites: PermissionOverwrite[];
+  user_limit?: number;
+}
+
+export interface ActivityBucket {
+  index: number;
+  totalVoiceMs: number;
+  mutedVoiceMs: number;
+  uniqueUsers: number;
+}
 
 const REQUIRED_CONFIG_KEYS = [
   "DISCORD_BOT_TOKEN",
   "DISCORD_GUILD_ID",
   "DISCORD_PARENT_CATEGORY_ID",
   "DISCORD_MENTION_ROLE_ID",
+  "DISCORD_DEEP_ROLE_ID",
+  "DISCORD_ACTIVITY_DETAIL_CHANNEL_ID",
 ] as const;
 
 export function getConfigIssues(env: Partial<Env>): string[] {
@@ -58,6 +112,8 @@ export function getConfigIssues(env: Partial<Env>): string[] {
     "DISCORD_GUILD_ID",
     "DISCORD_PARENT_CATEGORY_ID",
     "DISCORD_MENTION_ROLE_ID",
+    "DISCORD_DEEP_ROLE_ID",
+    "DISCORD_ACTIVITY_DETAIL_CHANNEL_ID",
   ] as const) {
     const value = env[key]?.trim();
     if (value && !/^\d+$/.test(value)) {
@@ -79,22 +135,27 @@ export function isDryRun(env: Pick<Env, "DRY_RUN">): boolean {
   return env.DRY_RUN?.trim().toLowerCase() === "true";
 }
 
-/**
- * Converts a UTC timestamp into the Japanese calendar date without relying
- * on runtime-specific timezone data. Japan Standard Time is UTC+09:00 and
- * does not observe daylight saving time.
- */
-export function japanDateKey(timestampMs: number): string {
+/** Returns the JST calendar date in YYYY-MM-DD form. */
+export function japanIsoDateKey(timestampMs: number): string {
   const japanTime = new Date(timestampMs + 9 * 60 * 60 * 1000);
+  const year = japanTime.getUTCFullYear();
   const month = String(japanTime.getUTCMonth() + 1).padStart(2, "0");
   const day = String(japanTime.getUTCDate()).padStart(2, "0");
-  return `${month}-${day}`;
+  return `${year}-${month}-${day}`;
+}
+
+/** Converts a UTC timestamp into the Japanese calendar date used in names. */
+export function japanDateKey(timestampMs: number): string {
+  return japanIsoDateKey(timestampMs).slice(5);
 }
 
 export function operationForScheduledTime(timestampMs: number): ScheduledOperation {
   const utcHour = new Date(timestampMs).getUTCHours();
   if (utcHour === OPEN_UTC_HOUR) {
     return "open";
+  }
+  if (utcHour === DEEP_OPEN_UTC_HOUR) {
+    return "open_deep";
   }
   if (utcHour === CLOSE_UTC_HOUR) {
     return "close";
@@ -107,11 +168,104 @@ export function channelNames(dateKey: string): ChannelNames {
     text: [
       `${TEXT_CHANNEL_PREFIX}1-${dateKey}`,
       `${TEXT_CHANNEL_PREFIX}2-${dateKey}`,
+      `${TEXT_CHANNEL_PREFIX}3-${dateKey}`,
     ],
     voice: [
       `${VOICE_CHANNEL_PREFIX}1-${dateKey}`,
       `${VOICE_CHANNEL_PREFIX}2-${dateKey}`,
+      `${VOICE_CHANNEL_PREFIX}3-${dateKey}`,
     ],
+    deepText: [
+      `${DEEP_CHANNEL_PREFIX}${TEXT_CHANNEL_PREFIX}1-${dateKey}`,
+      `${DEEP_CHANNEL_PREFIX}${TEXT_CHANNEL_PREFIX}2-${dateKey}`,
+    ],
+    deepVoice: [
+      `${DEEP_CHANNEL_PREFIX}${VOICE_CHANNEL_PREFIX}1-${dateKey}`,
+      `${DEEP_CHANNEL_PREFIX}${VOICE_CHANNEL_PREFIX}2-${dateKey}`,
+    ],
+  };
+}
+
+export function allChannelNames(names: ChannelNames): string[] {
+  return [...names.text, ...names.voice, ...names.deepText, ...names.deepVoice];
+}
+
+export function channelDefinitions(
+  dateKey: string,
+  guildId: string,
+  deepRoleId: string,
+  parentCategoryId = "",
+  botUserId?: string,
+): ChannelDefinition[] {
+  const names = channelNames(dateKey);
+  const definitions: ChannelDefinition[] = [];
+
+  names.text.forEach((name) => {
+    definitions.push({
+      name,
+      type: 0,
+      kind: "normal_text",
+      parent_id: parentCategoryId,
+      permission_overwrites: normalOverwrites(guildId, deepRoleId, botUserId),
+    });
+  });
+  names.voice.forEach((name, index) => {
+    definitions.push({
+      name,
+      type: 2,
+      kind: "normal_voice",
+      parent_id: parentCategoryId,
+      permission_overwrites: normalOverwrites(guildId, deepRoleId, botUserId),
+      user_limit: [0, 8, 4][index],
+    });
+  });
+  names.deepText.forEach((name) => {
+    definitions.push({
+      name,
+      type: 0,
+      kind: "deep_text",
+      parent_id: parentCategoryId,
+      permission_overwrites: deepOverwrites(guildId, deepRoleId, botUserId),
+    });
+  });
+  names.deepVoice.forEach((name, index) => {
+    definitions.push({
+      name,
+      type: 2,
+      kind: "deep_voice",
+      parent_id: parentCategoryId,
+      permission_overwrites: deepOverwrites(guildId, deepRoleId, botUserId),
+      user_limit: [0, 4][index],
+    });
+  });
+
+  return definitions;
+}
+
+export function buildDeepPublicOverwrite(guildId: string): PermissionOverwrite {
+  return {
+    id: guildId,
+    type: 0,
+    allow: String(VIEW_CHANNEL_BIT),
+    deny: String(THREAD_CREATION_BITS),
+  };
+}
+
+export function buildPrivateOverwrite(guildId: string): PermissionOverwrite {
+  return {
+    id: guildId,
+    type: 0,
+    allow: "0",
+    deny: String(VIEW_CHANNEL_BIT + THREAD_CREATION_BITS),
+  };
+}
+
+export function buildRolePrivateOverwrite(roleId: string): PermissionOverwrite {
+  return {
+    id: roleId,
+    type: 0,
+    allow: "0",
+    deny: String(VIEW_CHANNEL_BIT + THREAD_CREATION_BITS),
   };
 }
 
@@ -119,41 +273,17 @@ export function buildMorningGreeting(): string {
   return "今日もお疲れ様でした！おはようございます！";
 }
 
-export function buildMessageCountLog(messageCount: number): string {
-  return `今日のメッセージ数：${messageCount}件\n${buildMorningGreeting()}`;
-}
-
-export function isManagedChannel(
-  channel: DiscordChannel,
-  parentCategoryId: string,
-): boolean {
-  if (channel.parent_id !== parentCategoryId) {
-    return false;
-  }
-
-  if (channel.type === 0) {
-    return (
-      new RegExp(`^${escapeRegExp(TEXT_CHANNEL_PREFIX)}[12]-\\d{2}-\\d{2}$`).test(
-        channel.name ?? "",
-      ) ||
-      new RegExp(`^${escapeRegExp(LEGACY_TEXT_CHANNEL_PREFIX)}\\d{2}-\\d{2}$`).test(
-        channel.name ?? "",
-      )
-    );
-  }
-
-  if (channel.type === 2) {
-    return (
-      new RegExp(`^${escapeRegExp(VOICE_CHANNEL_PREFIX)}[12]-\\d{2}-\\d{2}$`).test(
-        channel.name ?? "",
-      ) ||
-      new RegExp(`^${escapeRegExp(LEGACY_VOICE_CHANNEL_PREFIX)}\\d{2}-\\d{2}$`).test(
-        channel.name ?? "",
-      )
-    );
-  }
-
-  return false;
+export function buildMessageCountLog(
+  messageCount: number,
+  visitorCount = 0,
+  bustleSeconds = 0,
+): string {
+  return [
+    `今日のメッセージ数：${messageCount}件`,
+    `今日の来場者数：${visitorCount}人`,
+    `賑わい：${bustleSeconds}`,
+    buildMorningGreeting(),
+  ].join("\n");
 }
 
 export function buildAnnouncementPayload(roleId: string): {
@@ -172,6 +302,172 @@ export function buildAnnouncementPayload(roleId: string): {
   };
 }
 
+export function buildDetailReport(
+  dateJst: string,
+  buckets: readonly ActivityBucket[],
+): string {
+  const label = dateJst.length >= 7
+    ? `${dateJst.slice(5, 7)}/${dateJst.slice(8, 10)}`
+    : dateJst.replace("-", "/");
+  const lines = [`【賑わい内訳 ${label}】`, "", "時間帯 | 滞在人数 | ミュート率"];
+
+  for (let index = 0; index < ACTIVITY_BUCKET_COUNT; index += 1) {
+    const bucket = buckets.find((candidate) => candidate.index === index);
+    const total = bucket?.totalVoiceMs ?? 0;
+    const muted = bucket?.mutedVoiceMs ?? 0;
+    const ratio = total > 0 ? (muted / total) * 100 : 0;
+    const startMinutes = index * ACTIVITY_BUCKET_MINUTES;
+    const endMinutes = startMinutes + ACTIVITY_BUCKET_MINUTES - 1;
+    lines.push(
+      `${formatClock(startMinutes)}-${formatClock(endMinutes)} | ${bucket?.uniqueUsers ?? 0}人 | ${ratio.toFixed(1)}%`,
+    );
+  }
+
+  const report = lines.join("\n");
+  if (report.length > 2000) {
+    throw new Error("Activity detail report exceeds Discord's 2000-character limit");
+  }
+  return report;
+}
+
+export function classifyManagedChannel(
+  channel: DiscordChannel,
+  parentCategoryId: string,
+): ManagedChannelKind | null {
+  if (channel.parent_id !== parentCategoryId) {
+    return null;
+  }
+
+  const name = channel.name ?? "";
+  if (channel.type === 0) {
+    if (new RegExp(`^${escapeRegExp(TEXT_CHANNEL_PREFIX)}[123]-\\d{2}-\\d{2}$`).test(name)) {
+      return "normal_text";
+    }
+    if (new RegExp(`^${escapeRegExp(DEEP_CHANNEL_PREFIX + TEXT_CHANNEL_PREFIX)}[12]-\\d{2}-\\d{2}$`).test(name)) {
+      return "deep_text";
+    }
+    if (new RegExp(`^${escapeRegExp(LEGACY_TEXT_CHANNEL_PREFIX)}\\d{2}-\\d{2}$`).test(name)) {
+      return "normal_text";
+    }
+    return null;
+  }
+
+  if (channel.type === 2) {
+    if (new RegExp(`^${escapeRegExp(VOICE_CHANNEL_PREFIX)}[123]-\\d{2}-\\d{2}$`).test(name)) {
+      return "normal_voice";
+    }
+    if (new RegExp(`^${escapeRegExp(DEEP_CHANNEL_PREFIX + VOICE_CHANNEL_PREFIX)}[12]-\\d{2}-\\d{2}$`).test(name)) {
+      return "deep_voice";
+    }
+    if (new RegExp(`^${escapeRegExp(LEGACY_VOICE_CHANNEL_PREFIX)}\\d{2}-\\d{2}$`).test(name)) {
+      return "normal_voice";
+    }
+  }
+
+  return null;
+}
+
+export function isManagedChannel(
+  channel: DiscordChannel,
+  parentCategoryId: string,
+): boolean {
+  return classifyManagedChannel(channel, parentCategoryId) !== null;
+}
+
+export function isManagedTextChannel(channel: DiscordChannel, parentCategoryId: string): boolean {
+  const kind = classifyManagedChannel(channel, parentCategoryId);
+  return kind === "normal_text" || kind === "deep_text";
+}
+
+export function isManagedVoiceChannel(channel: DiscordChannel, parentCategoryId: string): boolean {
+  const kind = classifyManagedChannel(channel, parentCategoryId);
+  return kind === "normal_voice" || kind === "deep_voice";
+}
+
+export function voiceUserLimit(kind: ManagedChannelKind, index: number): number | undefined {
+  if (kind === "normal_voice") {
+    return [0, 8, 4][index];
+  }
+  if (kind === "deep_voice") {
+    return [0, 4][index];
+  }
+  return undefined;
+}
+
+export const VIEW_CHANNEL_BIT = 1 << 10;
+export const SEND_MESSAGES_BIT = 1 << 11;
+export const CONNECT_BIT = 1 << 20;
+export const SPEAK_BIT = 1 << 21;
+export const CREATE_PUBLIC_THREADS_BIT = 2 ** 35;
+export const CREATE_PRIVATE_THREADS_BIT = 2 ** 36;
+export const THREAD_CREATION_BITS = CREATE_PUBLIC_THREADS_BIT + CREATE_PRIVATE_THREADS_BIT;
+
+function normalOverwrites(
+  guildId: string,
+  deepRoleId: string,
+  botUserId?: string,
+): PermissionOverwrite[] {
+  const overwrites: PermissionOverwrite[] = [
+    {
+      id: guildId,
+      type: 0,
+      allow: String(VIEW_CHANNEL_BIT | SEND_MESSAGES_BIT | CONNECT_BIT | SPEAK_BIT),
+      deny: String(THREAD_CREATION_BITS),
+    },
+    {
+      id: deepRoleId,
+      type: 0,
+      allow: "0",
+      deny: String(VIEW_CHANNEL_BIT + THREAD_CREATION_BITS),
+    },
+  ];
+  if (botUserId) {
+    overwrites.push({
+      id: botUserId,
+      type: 1,
+      allow: String(VIEW_CHANNEL_BIT | SEND_MESSAGES_BIT | CONNECT_BIT | SPEAK_BIT),
+      deny: String(THREAD_CREATION_BITS),
+    });
+  }
+  return overwrites;
+}
+
+function deepOverwrites(
+  guildId: string,
+  deepRoleId: string,
+  botUserId?: string,
+): PermissionOverwrite[] {
+  const overwrites: PermissionOverwrite[] = [
+    {
+      id: guildId,
+      type: 0,
+      allow: "0",
+      deny: String(VIEW_CHANNEL_BIT + THREAD_CREATION_BITS),
+    },
+    {
+      id: deepRoleId,
+      type: 0,
+      allow: String(VIEW_CHANNEL_BIT | SEND_MESSAGES_BIT | CONNECT_BIT | SPEAK_BIT),
+      deny: String(THREAD_CREATION_BITS),
+    },
+  ];
+  if (botUserId) {
+    overwrites.push({
+      id: botUserId,
+      type: 1,
+      allow: String(VIEW_CHANNEL_BIT | SEND_MESSAGES_BIT | CONNECT_BIT | SPEAK_BIT),
+      deny: String(THREAD_CREATION_BITS),
+    });
+  }
+  return overwrites;
+}
+
+function formatClock(totalMinutes: number): string {
+  const hours = String(Math.floor(totalMinutes / 60)).padStart(2, "0");
+  const minutes = String(totalMinutes % 60).padStart(2, "0");
+  return `${hours}:${minutes}`;
+}
+
 function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return value.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&");
 }

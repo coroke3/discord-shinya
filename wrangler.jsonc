@@ -6,9 +6,23 @@
   "observability": {
     "enabled": true
   },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "NIGHT_COORDINATOR",
+        "class_name": "NightCoordinator"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["NightCoordinator"]
+    }
+  ],
   "triggers": {
     "crons": [
-      "0 15,23 * * *"
+      "0 15,18,23 * * *"
     ]
   }
 }

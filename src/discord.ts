@@ -1,12 +1,11 @@
-import type { DiscordChannel, DiscordMessage, Env } from "./config";
+import type {
+  DiscordChannel,
+  Env,
+  PermissionOverwrite,
+} from "./config";
 
 const DISCORD_API_BASE = "https://discord.com/api/v10";
 const MAX_RETRIES = 2;
-const MESSAGE_PAGE_SIZE = 100;
-// The close operation counts two text channels and deletes four channels.
-// Keep pagination bounded so the normal path remains below the Workers Free
-// plan's 50-subrequest invocation limit.
-const MAX_MESSAGE_COUNT_PAGES = 20;
 
 export class DiscordApiError extends Error {
   constructor(
@@ -19,6 +18,18 @@ export class DiscordApiError extends Error {
   }
 }
 
+export class DiscordRateLimitError extends DiscordApiError {
+  constructor(
+    status: number,
+    method: string,
+    path: string,
+    public readonly retryAfterMs: number,
+  ) {
+    super(status, method, path);
+    this.name = "DiscordRateLimitError";
+  }
+}
+
 export async function listGuildChannels(env: Env): Promise<DiscordChannel[]> {
   return discordRequest<DiscordChannel[]>(env, `/guilds/${env.DISCORD_GUILD_ID}/channels`, {
     method: "GET",
@@ -27,7 +38,13 @@ export async function listGuildChannels(env: Env): Promise<DiscordChannel[]> {
 
 export async function createGuildChannel(
   env: Env,
-  payload: { name: string; type: 0 | 2; parent_id: string },
+  payload: {
+    name: string;
+    type: 0 | 2;
+    parent_id: string;
+    permission_overwrites?: PermissionOverwrite[];
+    user_limit?: number;
+  },
 ): Promise<DiscordChannel> {
   return discordRequest<DiscordChannel>(
     env,
@@ -45,47 +62,22 @@ export async function deleteChannel(env: Env, channelId: string): Promise<void> 
   });
 }
 
-export async function listChannelMessages(
+export async function putChannelPermission(
   env: Env,
   channelId: string,
-  before?: string,
-): Promise<DiscordMessage[]> {
-  const query = new URLSearchParams({ limit: String(MESSAGE_PAGE_SIZE) });
-  if (before) {
-    query.set("before", before);
-  }
-
-  return discordRequest<DiscordMessage[]>(
+  overwrite: PermissionOverwrite,
+): Promise<void> {
+  await discordRequest<void>(
     env,
-    `/channels/${channelId}/messages?${query.toString()}`,
-    { method: "GET" },
-  );
-}
-
-export async function countChannelMessages(
-  env: Env,
-  channelId: string,
-): Promise<number> {
-  let before: string | undefined;
-  let count = 0;
-
-  for (let page = 0; page < MAX_MESSAGE_COUNT_PAGES; page += 1) {
-    const messages = await listChannelMessages(env, channelId, before);
-    count += messages.length;
-
-    if (messages.length < MESSAGE_PAGE_SIZE) {
-      return count;
-    }
-
-    const oldestMessageId = messages[messages.length - 1]?.id;
-    if (!oldestMessageId) {
-      throw new Error(`Discord returned a full message page without an ID for ${channelId}`);
-    }
-    before = oldestMessageId;
-  }
-
-  throw new Error(
-    `Message count exceeded the safe pagination limit for channel ${channelId}`,
+    `/channels/${channelId}/permissions/${overwrite.id}`,
+    {
+      method: "PUT",
+      body: JSON.stringify({
+        allow: overwrite.allow,
+        deny: overwrite.deny,
+        type: overwrite.type,
+      }),
+    },
   );
 }
 
@@ -114,6 +106,39 @@ export async function createAnnouncement(
   });
 }
 
+export async function addGuildMemberRole(
+  env: Env,
+  userId: string,
+  roleId: string,
+): Promise<void> {
+  await discordRequest<void>(
+    env,
+    `/guilds/${env.DISCORD_GUILD_ID}/members/${userId}/roles/${roleId}`,
+    {
+      method: "PUT",
+      body: "",
+    },
+  );
+}
+
+export async function removeGuildMemberRole(
+  env: Env,
+  userId: string,
+  roleId: string,
+): Promise<void> {
+  await discordRequest<void>(
+    env,
+    `/guilds/${env.DISCORD_GUILD_ID}/members/${userId}/roles/${roleId}`,
+    {
+      method: "DELETE",
+    },
+  );
+}
+
+export function initialGatewayUrl(): string {
+  return "wss://gateway.discord.gg/?v=10&encoding=json";
+}
+
 async function discordRequest<T>(
   env: Env,
   path: string,
@@ -122,8 +147,10 @@ async function discordRequest<T>(
 ): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bot ${env.DISCORD_BOT_TOKEN}`);
-  headers.set("Content-Type", "application/json");
-  headers.set("User-Agent", "discord-shinya/1.0");
+  headers.set("User-Agent", "discord-shinya/2.0");
+  if (init.body && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
 
   const response = await fetch(`${DISCORD_API_BASE}${path}`, {
     ...init,
@@ -135,8 +162,17 @@ async function discordRequest<T>(
     return (body ? JSON.parse(body) : undefined) as T;
   }
 
-  if ((response.status === 429 || response.status >= 500) && attempt < MAX_RETRIES) {
-    await waitBeforeRetry(response, attempt);
+  if (response.status === 429) {
+    throw new DiscordRateLimitError(
+      response.status,
+      init.method ?? "GET",
+      path,
+      parseRetryAfterMs(response),
+    );
+  }
+
+  if (response.status >= 500 && attempt < MAX_RETRIES) {
+    await sleep(250 * 2 ** attempt);
     return discordRequest<T>(env, path, init, attempt + 1);
   }
 
@@ -145,11 +181,20 @@ async function discordRequest<T>(
   throw new DiscordApiError(response.status, init.method ?? "GET", path);
 }
 
-async function waitBeforeRetry(response: Response, attempt: number): Promise<void> {
-  const retryAfterSeconds = Number(response.headers.get("Retry-After"));
-  const delayMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
-    ? Math.min(retryAfterSeconds * 1000, 30_000)
-    : 500 * 2 ** attempt;
+function parseRetryAfterMs(response: Response): number {
+  const retryAfter = Number(response.headers.get("Retry-After"));
+  if (Number.isFinite(retryAfter) && retryAfter >= 0) {
+    return Math.ceil(retryAfter * 1000);
+  }
 
+  const resetAfter = Number(response.headers.get("X-RateLimit-Reset-After"));
+  if (Number.isFinite(resetAfter) && resetAfter >= 0) {
+    return Math.ceil(resetAfter * 1000);
+  }
+
+  return 1_000;
+}
+
+async function sleep(delayMs: number): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
 }
