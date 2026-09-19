@@ -172,6 +172,29 @@ describe("破壊的操作の安全策", () => {
       );
   });
 
+  it("投稿再試行用のnonceで同じ通知を二重作成しない", async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        requestBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        return new Response(null, { status: 204 });
+      }),
+    );
+
+    await createTextMessage(
+      liveTestEnv,
+      "123456789012345678",
+      "今日のログ",
+      { nonce: "summary-2026-08-29" },
+    );
+
+    expect(requestBody).toMatchObject({
+      nonce: "summary-2026-08-29",
+      enforce_nonce: true,
+    });
+  });
+
   it("チャンネル作成POSTの5xxを自動再送して二重作成しない", async () => {
     const fetchSpy = vi.fn(async () => new Response(null, { status: 502 }));
     vi.stubGlobal("fetch", fetchSpy);

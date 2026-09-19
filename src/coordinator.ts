@@ -107,6 +107,11 @@ interface GatewayReady {
   user?: { id?: string };
 }
 
+interface GatewayGuildCreate {
+  id?: string;
+  voice_states?: GatewayVoiceState[];
+}
+
 interface GatewayMessageCreate {
   channel_id?: string;
   author?: { id?: string; bot?: boolean; system?: boolean };
@@ -147,6 +152,7 @@ const DAILY_EPHEMERAL_STATE_KEYS = [
   "pending_operation",
   "open_after_cleanup",
   "next_open_date",
+  "deferred_open_deep_date",
   "message_count",
   "message_count_available",
   "visitor_count",
@@ -173,7 +179,8 @@ const DAILY_EPHEMERAL_STATE_KEYS = [
 /**
  * One coordinator exists per guild. All durable state that can affect a
  * future operation is kept in SQLite; the in-memory fields only hold the
- * currently open outbound Gateway socket and its heartbeat timer.
+ * currently open outbound Gateway socket, heartbeat timer, and same-instance
+ * I/O guards.
  */
 export class NightCoordinator {
   private readonly ctx: DurableObjectState;
@@ -183,6 +190,15 @@ export class NightCoordinator {
   private gatewayHeartbeatIntervalMs = 0;
   private gatewayAwaitingAck = false;
   private gatewayIdentifyOnly = false;
+  // Durable Objectの外部I/Oは入力イベントをまたいで並行実行されるため、
+  // 同じインスタンス内で重複しやすい処理だけを明示的に直列化する。
+  // インスタンスが再生成された場合はSQLiteの段階状態から再開する。
+  private openingFinishInProgress = false;
+  private openingInProgress = false;
+  private deepOpenInProgress = false;
+  private closingInProgress = false;
+  private reportsInProgress = false;
+  private alarmScheduleChain: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
@@ -210,11 +226,12 @@ export class NightCoordinator {
         return Response.json({ ok: false, error: "Invalid operation" }, { status: 400 });
       }
 
-      this.ctx.waitUntil(
-        this.runOperation(operation, body.scheduledTime ?? Date.now()).catch((error) => {
-          this.logOperationError(operation, error);
-        }),
-      );
+      // Durable ObjectではwaitUntilに依存せず、未完了のI/Oがある間は
+      // アクティブな処理として実行を継続する。void + catchでイベント側の
+      // Promiseを取りこぼさず、同時に202をすぐ返してCronを長時間拘束しない。
+      void this.runOperation(operation, body.scheduledTime ?? Date.now()).catch((error) => {
+        this.logOperationError(operation, error);
+      });
       return Response.json({ ok: true, accepted: true }, { status: 202 });
     }
 
@@ -227,6 +244,22 @@ export class NightCoordinator {
 
     try {
       const phase = this.getPhase();
+      const dateJst = this.getState("date_jst");
+      if (
+        dateJst &&
+        Date.now() >= japanNightEndMs(dateJst) &&
+        phase !== "CLOSED" &&
+        phase !== "BLOCKED"
+      ) {
+        // 08:00を越えた復旧Alarmは、公開処理を再開せず終了処理へ渡す。
+        // 00:00の失敗が長引いて朝にチャンネルを作る事故を防ぐ。
+        if (phase === "CLOSING" || phase === "REPORTING" || phase === "ROLE_SYNC") {
+          await this.continueClosing();
+        } else {
+          await this.beginClose(dateJst);
+        }
+        return;
+      }
       if (phase === "OPENING") {
         if (this.getState("opening_cleanup_done") !== "1") {
           const dateJst = this.getState("date_jst");
@@ -273,10 +306,21 @@ export class NightCoordinator {
         return;
       }
 
+      const dateJst = japanIsoDateKey(scheduledTime);
+      if (
+        (operation === "open" || operation === "open_deep") &&
+        Date.now() >= japanNightEndMs(dateJst)
+      ) {
+        // Cronや一時障害からの再試行が08:00を越えた場合、作成ではなく
+        // 当日分の終了処理だけを行う。CLOSEDなら保留Alarmも消費する。
+        await this.beginClose(dateJst);
+        return;
+      }
+
       if (operation === "open") {
-        await this.beginOpen(japanIsoDateKey(scheduledTime));
+        await this.beginOpen(dateJst);
       } else if (operation === "open_deep") {
-        await this.beginOpenDeep(japanIsoDateKey(scheduledTime));
+        await this.beginOpenDeep(dateJst);
       } else {
         await this.beginClose(japanIsoDateKey(scheduledTime));
       }
@@ -287,8 +331,45 @@ export class NightCoordinator {
   }
 
   private async beginOpen(dateJst: string): Promise<void> {
+    if (this.openingInProgress) {
+      // 既存の実行がチャンネル掃除・作成を進めている間は、二重作成や
+      // 後続処理によるmanaged_channelsの消去を避け、Alarmで再確認する。
+      await this.scheduleAlarmAt(Date.now() + 5_000);
+      return;
+    }
+    this.openingInProgress = true;
+    try {
+      await this.beginOpenInternal(dateJst);
+    } finally {
+      this.openingInProgress = false;
+    }
+  }
+
+  private async beginOpenInternal(dateJst: string): Promise<void> {
+    // 前夜の深層公開APIがまだ進行中なら、新しい日付の掃除と権限変更を
+    // 同時に走らせない。外部I/O中は別イベントが割り込めるための保護。
+    if (
+      this.deepOpenInProgress &&
+      this.getState("date_jst") !== dateJst &&
+      this.getState("deferred_open_deep_date") !== dateJst
+    ) {
+      await this.scheduleAlarmAt(Date.now() + 5_000);
+      return;
+    }
     const phase = this.getPhase();
     const currentDate = this.getState("date_jst");
+
+    // 前日の終了処理がまだ段階途中なら、ロール同期・レポートがたまたま
+    // 完了済みでも、新しい日付のOPENINGへ先に進めない。削除処理と作成処理
+    // の並行実行は、管理対象の取り違えにつながる。
+    if (phase === "CLOSING" || phase === "REPORTING" || phase === "ROLE_SYNC") {
+      if (currentDate !== dateJst) {
+        this.setState("open_after_cleanup", "1");
+        this.setState("next_open_date", dateJst);
+      }
+      await this.continueClosing();
+      return;
+    }
 
     if ((phase === "SEPARATED" || phase === "ALL_OPEN") && currentDate === dateJst) {
       if (!this.isGatewayConnected()) {
@@ -347,7 +428,9 @@ export class NightCoordinator {
         this.connectGateway();
       }
       if (this.isGatewayConnected()) {
-        await this.finishOpen();
+        // 古いチャンネルの削除と新規チャンネル作成を同じInvocationに
+        // 詰め込まず、次のAlarmへ分けてFreeのsubrequest上限を守る。
+        await this.scheduleAlarmAt(Date.now() + 1_000);
       } else {
         await this.scheduleGatewayWatchdog();
       }
@@ -356,7 +439,8 @@ export class NightCoordinator {
 
     this.setState("phase", "OPENING");
     this.setState("date_jst", dateJst);
-    this.setState("pending_operation", "open");
+    const deferredDeepOpen = this.getState("deferred_open_deep_date") === dateJst;
+    this.setState("pending_operation", deferredDeepOpen ? "open_deep" : "open");
     this.setState("open_after_cleanup", "0");
     this.setState("next_open_date", "");
     this.setState("metrics_integrity", "complete");
@@ -403,14 +487,32 @@ export class NightCoordinator {
 
     this.connectGateway();
     if (this.isGatewayConnected()) {
-      await this.finishOpen();
+      // cleanupとfinishOpenを別Invocationに分離する。
+      await this.scheduleAlarmAt(Date.now() + 1_000);
     } else {
       await this.scheduleGatewayWatchdog();
     }
   }
 
   private async finishOpen(): Promise<void> {
+    if (this.openingFinishInProgress) {
+      return;
+    }
+    this.openingFinishInProgress = true;
+    try {
+      await this.finishOpenInternal();
+    } finally {
+      this.openingFinishInProgress = false;
+    }
+  }
+
+  private async finishOpenInternal(): Promise<void> {
     if (this.getPhase() !== "OPENING") {
+      return;
+    }
+    // READYが古いチャンネル掃除より先に届くことがある。掃除完了前に
+    // 新しいチャンネルを作ると、旧チャンネルと新チャンネルが混在する。
+    if (this.getState("opening_cleanup_done") !== "1") {
       return;
     }
 
@@ -452,12 +554,23 @@ export class NightCoordinator {
 
       for (const definition of definitions) {
         const existing = registeredByName.get(`${definition.kind}:${definition.name}`);
-        if (existing) {
-          continue;
-        }
         const existingRemote = currentByName.get(
           `${definition.parent_id}:${definition.type}:${definition.name}`,
         );
+
+        // 前回の途中失敗でDBだけが残ると、削除済み・移動済みのチャンネルを
+        // 既存扱いしてしまう。リモートIDが一致する場合だけ再利用し、それ
+        // 以外は登録を捨てて、現在のDiscord状態から再登録・再作成する。
+        if (existing && existingRemote?.id === existing.channel_id) {
+          this.registerManagedChannel(existingRemote.id, definition.name, definition.kind, dateJst);
+          continue;
+        }
+        if (existing) {
+          this.ctx.storage.sql.exec(
+            "DELETE FROM managed_channels WHERE channel_id = ?",
+            existing.channel_id,
+          );
+        }
         if (existingRemote) {
           this.registerManagedChannel(existingRemote.id, definition.name, definition.kind, dateJst);
           continue;
@@ -482,7 +595,12 @@ export class NightCoordinator {
         await createAnnouncement(
           this.env,
           firstText.channel_id,
-          buildAnnouncementPayload(this.env.DISCORD_MENTION_ROLE_ID),
+          {
+            ...buildAnnouncementPayload(this.env.DISCORD_MENTION_ROLE_ID),
+            // チャンネルIDをnonceに含め、作成途中でチャンネルをロール
+            // バックしても、別チャンネルの通知と衝突しないようにする。
+            nonce: `open-${firstText.channel_id}`,
+          },
         );
         this.setState("announcement_sent", "1");
       }
@@ -490,14 +608,24 @@ export class NightCoordinator {
         await createAnnouncement(
           this.env,
           firstDeepText.channel_id,
-          buildAnnouncementPayload(this.env.DISCORD_MENTION_ROLE_ID),
+          {
+            ...buildAnnouncementPayload(this.env.DISCORD_MENTION_ROLE_ID),
+            nonce: `open-${firstDeepText.channel_id}`,
+          },
         );
         this.setState("deep_announcement_sent", "1");
       }
 
+      // 03:00の公開処理が、00:00のチャンネル作成完了前に到着する場合が
+      // ある。判定は外部API処理の直後に行い、作成中に届いた遅延イベントも
+      // 取りこぼさない。
+      const pendingDeepOpen = this.getState("pending_operation") === "open_deep";
       this.setState("phase", "SEPARATED");
       this.setState("opening_stage", "done");
-      this.setState("pending_operation", "");
+      this.setState("pending_operation", pendingDeepOpen ? "open_deep" : "");
+      if (pendingDeepOpen) {
+        await this.scheduleAlarmAt(Date.now() + 1_000);
+      }
       console.log(`Created ${EXPECTED_CHANNEL_COUNT} night channels for ${dateJst}`);
     } catch (error) {
       if (this.getPhase() === "OPENING") {
@@ -534,16 +662,38 @@ export class NightCoordinator {
   }
 
   private async beginOpenDeep(dateJst: string): Promise<void> {
-    this.setState("pending_operation", "open_deep");
-    if (this.getState("date_jst") !== dateJst) {
-      console.error("Deep opening ignored because the JST date is not open");
-      this.setState("pending_operation", "");
+    if (this.deepOpenInProgress) {
+      await this.scheduleAlarmAt(Date.now() + 5_000);
       return;
     }
+    this.deepOpenInProgress = true;
+    try {
+      await this.beginOpenDeepInternal(dateJst);
+    } finally {
+      this.deepOpenInProgress = false;
+    }
+  }
+
+  private async beginOpenDeepInternal(dateJst: string): Promise<void> {
+    if (this.getState("date_jst") !== dateJst) {
+      // 00:00のCronが欠落して03:00だけ到着しても、その日の通常チャンネル
+      // を作成してから深層公開まで続ける。予約日は日次状態として保持し、
+      // beginOpenが前日の後処理を待つ場合も、途中再起動で意図を失わない。
+      this.setState("deferred_open_deep_date", dateJst);
+      await this.beginOpen(dateJst);
+      return;
+    }
+    this.setState("pending_operation", "open_deep");
+    this.setState("deferred_open_deep_date", "");
 
     const phase = this.getPhase();
     if (phase !== "SEPARATED" && phase !== "ALL_OPEN") {
       await this.scheduleAlarmAt(Date.now() + 5_000);
+      return;
+    }
+    if (phase === "ALL_OPEN") {
+      // 既に公開済みの重複Cronは、公開処理を再実行せず意図だけ消費する。
+      this.setState("pending_operation", "");
       return;
     }
 
@@ -587,6 +737,9 @@ export class NightCoordinator {
     }
 
     for (const channel of deepChannels) {
+      if (this.getPhase() !== "SEPARATED" || this.getState("date_jst") !== dateJst) {
+        return;
+      }
       await putChannelPermission(
         this.env,
         channel.channel_id,
@@ -599,10 +752,28 @@ export class NightCoordinator {
   }
 
   private async beginClose(dateJst: string): Promise<void> {
-    if (this.getPhase() === "CLOSED" && this.getState("date_jst") !== dateJst) {
+    const phase = this.getPhase();
+    // 作成処理や深層公開処理の途中でCLOSINGへ遷移すると、後から到着した
+    // 外部APIの完了処理が公開状態を復活させ得る。完了を待ってから閉じる。
+    if (
+      this.deepOpenInProgress ||
+      (phase === "OPENING" && (this.openingInProgress || this.openingFinishInProgress))
+    ) {
+      await this.scheduleAlarmAt(Date.now() + (phase === "OPENING" ? 30_000 : 5_000));
       return;
     }
-    if (this.getPhase() === "CLOSED" && this.getState("close_stage") === "done") {
+
+    // 実行中のOPENINGを待つのは上の条件だけ。外部I/Oが既に終わった後も
+    // OPENINGだけが残ると08:00削除が永久に始まらないため、停止した作成処理
+    // はCLOSINGへ引き継ぐ。削除段階ではDiscord上の管理対象を再走査する。
+    if (phase === "OPENING") {
+      console.error("Closing superseded an unfinished opening operation");
+    }
+
+    if (phase === "CLOSED" && this.getState("date_jst") !== dateJst) {
+      return;
+    }
+    if (phase === "CLOSED" && this.getState("close_stage") === "done") {
       return;
     }
 
@@ -614,6 +785,18 @@ export class NightCoordinator {
   }
 
   private async continueClosing(): Promise<void> {
+    if (this.closingInProgress) {
+      return;
+    }
+    this.closingInProgress = true;
+    try {
+      await this.continueClosingInternal();
+    } finally {
+      this.closingInProgress = false;
+    }
+  }
+
+  private async continueClosingInternal(): Promise<void> {
     const dateJst = this.getState("date_jst");
     if (!dateJst) {
       throw new Error("Closing has no JST date");
@@ -630,6 +813,9 @@ export class NightCoordinator {
     if (stage === "role_queue" || stage === "role_sync" || stage === "done") {
       this.setState("phase", "REPORTING");
       await this.sendReports(dateJst);
+      if (!this.reportsAreComplete()) {
+        return;
+      }
     }
 
     if (stage === "flush") {
@@ -641,44 +827,98 @@ export class NightCoordinator {
     if (this.getState("close_stage") === "lock") {
       await this.lockRegisteredChannels(dateJst);
       this.setState("close_stage", "gateway");
+      // 1回のAlarmで権限変更・削除・レポート・ロール同期まで連続実行
+      // すると、Workers Freeのsubrequest上限を超える。段階ごとに返す。
+      await this.scheduleAlarmAt(Date.now() + 1_000);
+      return;
     }
 
     if (this.getState("close_stage") === "gateway") {
       this.closeGateway();
       this.setState("close_stage", "delete");
+      await this.scheduleAlarmAt(Date.now() + 1_000);
+      return;
     }
 
     if (this.getState("close_stage") === "delete") {
       const registered = await this.ensureRegisteredChannels(dateJst);
-      if (!await this.deleteChannels(registered.map((channel) => channel.channel_id))) {
+      // OPENING失敗や前回の途中停止でDB登録が欠けても、厳密な名前・
+      // カテゴリ・種別に一致するDiscord上の管理対象を取りこぼさない。
+      const remote = await listGuildChannels(this.env);
+      const channelIds = new Set(registered.map((channel) => channel.channel_id));
+      for (const channel of remote) {
+        if (
+          classifyManagedChannel(
+            channel,
+            this.env.DISCORD_PARENT_CATEGORY_ID,
+            this.env.DISCORD_DEEP_PARENT_CATEGORY_ID,
+          ) !== null
+        ) {
+          channelIds.add(channel.id);
+        }
+      }
+      if (!await this.deleteChannels([...channelIds])) {
         return;
       }
       this.clearManagedChannels();
       this.setState("close_stage", "reports");
+      await this.scheduleAlarmAt(Date.now() + 1_000);
+      return;
     }
 
     if (this.getState("close_stage") === "reports") {
       this.setState("phase", "REPORTING");
       await this.sendReports(dateJst);
+      if (!this.reportsAreComplete()) {
+        return;
+      }
       this.setState("close_stage", "role_queue");
+      await this.scheduleAlarmAt(Date.now() + 1_000);
+      return;
     }
 
     if (this.getState("close_stage") === "role_queue") {
       this.prepareRoleSync(dateJst);
       this.setState("close_stage", "role_sync");
       this.setState("phase", "ROLE_SYNC");
+      await this.scheduleAlarmAt(Date.now() + 1_000);
+      return;
     }
 
     if (this.getState("close_stage") === "role_sync") {
       await this.processRoleSync(dateJst);
+      if (this.getState("close_stage") !== "done") {
+        return;
+      }
     }
 
     await this.finalizeCloseIfReady(dateJst);
   }
 
   private async sendReports(dateJst: string): Promise<void> {
-    const messageCount = Number(this.getState("message_count") ?? "0");
-    const visitorCount = Number(this.getState("visitor_count") ?? "0");
+    if (this.reportsInProgress) {
+      return;
+    }
+    this.reportsInProgress = true;
+    try {
+      await this.sendReportsInternal(dateJst);
+    } finally {
+      this.reportsInProgress = false;
+    }
+  }
+
+  private async sendReportsInternal(dateJst: string): Promise<void> {
+    const rawMessageCount = Number(this.getState("message_count") ?? "0");
+    const rawVisitorCount = Number(this.getState("visitor_count") ?? "0");
+    const messageCount = Number.isSafeInteger(rawMessageCount) && rawMessageCount >= 0
+      ? rawMessageCount
+      : 0;
+    const visitorCount = Number.isSafeInteger(rawVisitorCount) && rawVisitorCount >= 0
+      ? rawVisitorCount
+      : 0;
+    if (messageCount !== rawMessageCount || visitorCount !== rawVisitorCount) {
+      this.markGatewayDegraded();
+    }
     const buckets = this.activityBuckets(dateJst);
     const bustle = weightedBustleSeconds(buckets);
 
@@ -691,6 +931,7 @@ export class NightCoordinator {
           this.env,
           MESSAGE_LOG_CHANNEL_ID,
           summary,
+          { nonce: `summary-${dateJst}` },
         );
         this.setState("report_sent", "1");
       } catch (error) {
@@ -709,6 +950,7 @@ export class NightCoordinator {
             buckets,
             this.getState("message_count_available") === "1",
           ),
+          { nonce: `detail-${dateJst}` },
         );
         this.setState("detail_report_sent", "1");
       } catch (error) {
@@ -833,12 +1075,25 @@ export class NightCoordinator {
     if (roleSyncComplete && reportsComplete && this.getState("close_stage") === "done") {
       const nextOpenDate = this.getState("next_open_date");
       const shouldOpenNextDay = this.getState("open_after_cleanup") === "1" && nextOpenDate;
+      const nextOpenDeepDate = this.getState("deferred_open_deep_date");
       this.clearDailyEphemeralState();
       this.setState("phase", "CLOSED");
       // 成功後に残った復旧Alarmを消し、次の日の処理だけが新しいAlarmを作る。
       await this.ctx.storage.deleteAlarm();
       if (shouldOpenNextDay && nextOpenDate) {
-        await this.beginOpen(nextOpenDate);
+        // 03:00の深層公開が前日の終了処理を待っていた場合は、日次状態を
+        // 消去した後も、その予約だけを次のOPENINGへ引き継ぐ。
+        if (nextOpenDeepDate === nextOpenDate) {
+          this.setState("deferred_open_deep_date", nextOpenDate);
+        }
+        // 00:00のbeginOpenが前日の終了処理を待っている場合、ここは
+        // beginOpenの再入呼び出しになる。ロックに弾かれてAlarmだけ残すと、
+        // CLOSEDのalarm()は新規OPENを知らないため、同日分を取りこぼす。
+        if (this.openingInProgress) {
+          await this.beginOpenInternal(nextOpenDate);
+        } else {
+          await this.beginOpen(nextOpenDate);
+        }
       }
       return;
     }
@@ -925,10 +1180,6 @@ export class NightCoordinator {
 
   private async ensureRegisteredChannels(dateJst: string): Promise<StoredChannel[]> {
     const stored = this.registeredChannels();
-    if (stored.length >= EXPECTED_CHANNEL_COUNT) {
-      return stored;
-    }
-
     const expected = new Map(
       channelDefinitions(
         dateJst.slice(5),
@@ -938,14 +1189,43 @@ export class NightCoordinator {
         this.env.DISCORD_DEEP_PARENT_CATEGORY_ID,
       ).map((definition) => [definition.name, definition] as const),
     );
+    const validStored = new Map<string, StoredChannel>();
+    for (const channel of stored) {
+      const definition = expected.get(channel.name);
+      if (
+        channel.date_jst === dateJst &&
+        definition?.kind === channel.kind
+      ) {
+        validStored.set(`${channel.kind}:${channel.name}`, channel);
+      }
+    }
+    if (validStored.size === EXPECTED_CHANNEL_COUNT) {
+      return [...validStored.values()];
+    }
+
     const remote = await listGuildChannels(this.env);
     for (const channel of remote) {
       const definition = expected.get(channel.name ?? "");
-      if (definition && channel.parent_id === definition.parent_id) {
+      const remoteKind = classifyManagedChannel(
+        channel,
+        this.env.DISCORD_PARENT_CATEGORY_ID,
+        this.env.DISCORD_DEEP_PARENT_CATEGORY_ID,
+      );
+      if (
+        definition &&
+        channel.parent_id === definition.parent_id &&
+        channel.type === definition.type &&
+        remoteKind === definition.kind
+      ) {
         this.registerManagedChannel(channel.id, channel.name ?? "", definition.kind, dateJst);
       }
     }
-    return this.registeredChannels();
+
+    // 古い日付・種別・カテゴリの登録を、現在の終了処理の対象に混ぜない。
+    return this.registeredChannels().filter((channel) => {
+      const definition = expected.get(channel.name);
+      return channel.date_jst === dateJst && definition?.kind === channel.kind;
+    });
   }
 
   private async deleteChannels(channelIds: readonly string[]): Promise<boolean> {
@@ -1084,10 +1364,16 @@ export class NightCoordinator {
       this.gatewaySocket = socket;
       this.setState("gateway_connect_started_at", String(Date.now()));
       socket.addEventListener("message", (event) => {
-        this.ctx.waitUntil(this.handleGatewayMessage(socket, event.data));
+        // Durable ObjectのWebSocketイベントではwaitUntilに依存しない。
+        // 非同期処理の失敗を必ず捕捉し、Gateway復旧Alarmへつなげる。
+        void this.handleGatewayMessage(socket, event.data).catch((error) => {
+          this.handleGatewayTaskError(error);
+        });
       });
       socket.addEventListener("close", (event) => {
-        this.ctx.waitUntil(this.handleGatewayClose(socket, event.code));
+        void this.handleGatewayClose(socket, event.code).catch((error) => {
+          this.handleGatewayTaskError(error);
+        });
       });
       socket.addEventListener("error", () => {
         // The close event drives the reconnect path. Payloads and error bodies
@@ -1099,9 +1385,22 @@ export class NightCoordinator {
         }
       });
     } catch (error) {
-      this.logGatewayError(error);
-      this.ctx.waitUntil(this.scheduleRetry("gateway", error));
+      this.handleGatewayTaskError(error);
     }
+  }
+
+  private handleGatewayTaskError(error: unknown): void {
+    const phase = this.getPhase();
+    if (phase === "CLOSED" || phase === "BLOCKED") {
+      return;
+    }
+    this.logGatewayError(error);
+    if (this.isTrackingPhase()) {
+      this.markGatewayDegraded();
+    }
+    void this.scheduleRetry("gateway", error).catch((scheduleError) => {
+      this.logOperationError("gateway retry", scheduleError);
+    });
   }
 
   private async handleGatewayMessage(socket: WebSocket, raw: string | ArrayBuffer): Promise<void> {
@@ -1159,7 +1458,9 @@ export class NightCoordinator {
     if (!Number.isFinite(interval) || interval <= 0) {
       this.markGatewayDegraded();
       this.closeGateway();
-      this.ctx.waitUntil(this.scheduleAlarmAt(Date.now() + 1_000));
+      void this.scheduleAlarmAt(Date.now() + 1_000).catch((error) => {
+        this.logOperationError("gateway hello retry", error);
+      });
       return;
     }
 
@@ -1272,6 +1573,20 @@ export class NightCoordinator {
       return;
     }
 
+    if (type === "GUILD_CREATE") {
+      const guild = (data ?? {}) as GatewayGuildCreate;
+      if (guild.id !== this.env.DISCORD_GUILD_ID || !Array.isArray(guild.voice_states)) {
+        return;
+      }
+      // 再接続時は、既に通話中の利用者に対するVOICE_STATE_UPDATEが
+      // 改めて届かないことがある。GUILD_CREATEのスナップショットも同じ
+      // 匿名セッション処理へ渡し、再接続直後の滞在人数を取りこぼさない。
+      for (const state of guild.voice_states) {
+        this.handleVoiceState({ ...state, guild_id: guild.id });
+      }
+      return;
+    }
+
     if (type === "RESUMED") {
       this.gatewayIdentifyOnly = false;
       this.setState("gateway_connect_started_at", "");
@@ -1307,25 +1622,36 @@ export class NightCoordinator {
 
     const now = Date.now();
     const dateJst = this.getState("date_jst");
-    const count = Number(this.getState("message_count") ?? "0");
-    this.setState("message_count", String(count + 1));
-
+    const storedCount = Number(this.getState("message_count") ?? "0");
+    const count = Number.isSafeInteger(storedCount) && storedCount >= 0
+      ? storedCount
+      : 0;
+    if (count !== storedCount) {
+      // 壊れた状態をNaNとして保存・報告しない。集計の信頼性は落とし、
+      // 終了時は件数ではなく挨拶だけを送る既存の保守動作へ切り替える。
+      this.markGatewayDegraded();
+    }
     const bucketIndex = dateJst === null ? null : activityBucketIndexAt(dateJst, now);
-    if (bucketIndex !== null) {
-      this.ctx.storage.sql.exec(
-        `INSERT INTO message_buckets (date_jst, bucket_index, message_count)
-         VALUES (?, ?, 1)
-         ON CONFLICT(date_jst, bucket_index) DO UPDATE SET
-           message_count = message_count + 1`,
-        dateJst,
-        bucketIndex,
-      );
-    }
-
     const author = message.author;
-    if (author?.id && !author.bot && !author.system) {
-      this.markDailyUsage(dateJst, author.id);
-    }
+    this.ctx.storage.transactionSync(() => {
+      // 総数・内訳・来場者判定を同時に確定し、途中停止でログと詳細内訳が
+      // 食い違う状態を作らない。
+      this.setState("message_count", String(count + 1));
+      if (bucketIndex !== null) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO message_buckets (date_jst, bucket_index, message_count)
+           VALUES (?, ?, 1)
+           ON CONFLICT(date_jst, bucket_index) DO UPDATE SET
+             message_count = message_count + 1`,
+          dateJst,
+          bucketIndex,
+        );
+      }
+
+      if (author?.id && !author.bot && !author.system) {
+        this.markDailyUsage(dateJst, author.id);
+      }
+    });
   }
 
   private handleVoiceState(state: GatewayVoiceState): void {
@@ -1352,32 +1678,45 @@ export class NightCoordinator {
       : undefined;
     const active = this.activeVoiceSession(userId);
     const nextMuted = !isUnmutedVoiceState(state.self_mute, state.mute);
-
-    if (active && (active.channel_id !== nextChannelId || active.muted !== Number(nextMuted))) {
-      this.recordVoiceInterval({
-        userId,
-        startedAt: active.segment_started_at,
-        endedAt: now,
-        muted: active.muted === 1,
-      }, active.date_jst);
-      this.deleteActiveSession(userId);
+    const shouldSwitchSession = Boolean(
+      active && (active.channel_id !== nextChannelId || active.muted !== Number(nextMuted)),
+    );
+    const nextIsManagedVoice = Boolean(nextChannel && this.isVoiceKind(nextChannel.kind));
+    const shouldRegisterSession = nextIsManagedVoice && (!active || shouldSwitchSession);
+    if (!shouldSwitchSession && !shouldRegisterSession) {
+      return;
     }
 
-    if (nextChannel && this.isVoiceKind(nextChannel.kind)) {
-      this.markDailyUsage(dateJst, userId);
-      if (!active || active.channel_id !== nextChannelId || active.muted !== Number(nextMuted)) {
-        this.ctx.storage.sql.exec(
-          `INSERT OR REPLACE INTO active_voice_sessions
-           (user_id, date_jst, channel_id, segment_started_at, muted)
-           VALUES (?, ?, ?, ?, ?)`,
+    // 区間の確定・旧セッション削除・新セッション登録を一つの同期
+    // トランザクションにする。途中停止後の再送で同じ区間を二重加算したり、
+    // 状態切替の間に新しい区間を取りこぼしたりしないようにする。
+    this.ctx.storage.transactionSync(() => {
+      if (shouldSwitchSession && active) {
+        this.recordVoiceInterval({
           userId,
-          dateJst,
-          nextChannelId,
-          now,
-          nextMuted ? 1 : 0,
-        );
+          startedAt: active.segment_started_at,
+          endedAt: now,
+          muted: active.muted === 1,
+        }, active.date_jst);
+        this.deleteActiveSession(userId);
       }
-    }
+
+      if (nextIsManagedVoice) {
+        this.markDailyUsage(dateJst, userId);
+        if (shouldRegisterSession) {
+          this.ctx.storage.sql.exec(
+            `INSERT OR REPLACE INTO active_voice_sessions
+             (user_id, date_jst, channel_id, segment_started_at, muted)
+             VALUES (?, ?, ?, ?, ?)`,
+            userId,
+            dateJst,
+            nextChannelId,
+            now,
+            nextMuted ? 1 : 0,
+          );
+        }
+      }
+    });
   }
 
   private async handleInvalidSession(canResume: boolean): Promise<void> {
@@ -1462,11 +1801,38 @@ export class NightCoordinator {
     const delay = error instanceof DiscordRateLimitError
       ? Math.max(1_000, error.retryAfterMs)
       : 300_000;
-    this.setState("pending_operation", operation);
+    const phase = this.getPhase();
+    // pending_operationはAlarmが再開する公開処理の意図として使う。
+    // 終了処理中に遅れて返ったopen/open_deepのエラーでcloseを上書き
+    // しないよう、現在のフェーズと矛盾する操作は保存しない。
+    // また、OPENING中に03:00のopen_deepが先に記録されている場合は、
+    // 00:00側の再試行でopenへ戻さない。作成完了後に深層公開へ進むための
+    // 予約を失うと、その日の深層チャンネルが非公開のままになる。
+    const pendingOperation = this.getState("pending_operation");
+    const canKeepPendingOperation =
+      (operation === "open" && phase === "OPENING" && pendingOperation !== "open_deep") ||
+      (operation === "open_deep" && ACTIVE_PHASES.has(phase)) ||
+      (operation === "close" &&
+        (phase === "CLOSING" || phase === "REPORTING" || phase === "ROLE_SYNC"));
+    if (canKeepPendingOperation) {
+      this.setState("pending_operation", operation);
+    }
     await this.scheduleAlarmAt(Date.now() + delay);
   }
 
-  private async scheduleAlarmAt(timestamp: number): Promise<void> {
+  private scheduleAlarmAt(timestamp: number): Promise<void> {
+    // getAlarm()とsetAlarm()の間に別イベントが割り込むと、後から来た
+    // 遅いAlarmが、先に登録した早いAlarmを上書きする可能性がある。
+    // 同一インスタンス内では読み取り・更新を直列化する。
+    const scheduled = this.alarmScheduleChain.then(
+      () => this.scheduleAlarmAtInternal(timestamp),
+      () => this.scheduleAlarmAtInternal(timestamp),
+    );
+    this.alarmScheduleChain = scheduled.catch(() => undefined);
+    return scheduled;
+  }
+
+  private async scheduleAlarmAtInternal(timestamp: number): Promise<void> {
     const existing = await this.ctx.storage.getAlarm();
     if (existing === null || timestamp < existing) {
       this.setState("alarm_due", String(timestamp));
@@ -1478,8 +1844,14 @@ export class NightCoordinator {
     const registered = this.registeredChannels();
     const phase = this.getPhase();
     const integrity = this.getState("metrics_integrity") || "degraded";
+    const stable = phase === "CLOSED" ||
+      ((phase === "SEPARATED" || phase === "ALL_OPEN") &&
+        registered.length === EXPECTED_CHANNEL_COUNT &&
+        this.isGatewayConnected());
     return {
-      ok: phase !== "BLOCKED" && integrity === "complete",
+      // OPENING/CLOSING/REPORTING/ROLE_SYNC中や、チャンネル数・Gatewayが
+      // 不完全な状態を200として返すと、監視側が障害を見逃してしまう。
+      ok: phase !== "BLOCKED" && integrity === "complete" && stable,
       phase,
       dateJst: this.getState("date_jst") ?? null,
       gateway: {
@@ -1578,15 +1950,17 @@ export class NightCoordinator {
       dateJst,
     );
     for (const session of active) {
-      this.recordVoiceInterval({
-        userId: session.user_id,
-        startedAt: session.segment_started_at,
-        endedAt: cutoff,
-        muted: session.muted === 1,
-      }, dateJst);
-      // 全セッションを最後にまとめて消すと、後続セッションの失敗時に
-      // 成功済み分を再度加算するため、確定した利用者から順に消す。
-      this.deleteActiveSession(session.user_id);
+      this.ctx.storage.transactionSync(() => {
+        this.recordVoiceInterval({
+          userId: session.user_id,
+          startedAt: session.segment_started_at,
+          endedAt: cutoff,
+          muted: session.muted === 1,
+        }, dateJst);
+        // 区間の保存と削除を同じトランザクションにして、再試行時の
+        // 二重加算を防ぐ。利用者単位で確定するため途中失敗にも強い。
+        this.deleteActiveSession(session.user_id);
+      });
     }
     this.deleteActiveSessions(dateJst);
   }

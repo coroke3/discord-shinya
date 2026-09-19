@@ -6,16 +6,17 @@ export const TIME_ZONE = "Asia/Tokyo";
 export const MESSAGE_LOG_CHANNEL_ID = "1543273845257928747";
 export const EXPECTED_CHANNEL_COUNT = 10;
 export const GATEWAY_INTENTS = 641;
-export const MAX_ROLE_OPERATIONS_PER_ALARM = 20;
 export const NIGHT_START_HOUR_JST = 0;
 export const DEEP_START_HOUR_JST = 3;
 export const NIGHT_END_HOUR_JST = 8;
 export const ACTIVITY_BUCKET_MINUTES = 30;
 export const ACTIVITY_BUCKET_COUNT =
   ((NIGHT_END_HOUR_JST - NIGHT_START_HOUR_JST) * 60) / ACTIVITY_BUCKET_MINUTES;
-// Workers Freeの1回あたりsubrequest上限に余裕を残すため、削除は20件ずつ行う。
+// Discord APIのGET/PUT/DELETEは5xx時に最大2回再試行するため、論理操作を
+// 10件に抑えても1回のAlarm内のsubrequestが50件を超えないようにする。
 // 残りの対象はDurable Object Alarmで次回へ引き継ぐ。
-export const MAX_CHANNEL_DELETE_OPERATIONS_PER_ALARM = 20;
+export const MAX_CHANNEL_DELETE_OPERATIONS_PER_ALARM = 10;
+export const MAX_ROLE_OPERATIONS_PER_ALARM = 10;
 
 export const TEXT_CHANNEL_PREFIX = "深夜限定テキスト";
 export const VOICE_CHANNEL_PREFIX = "深夜限定通話";
@@ -24,15 +25,12 @@ export const DEEP_CHANNEL_PREFIX = "深層-";
 const LEGACY_TEXT_CHANNEL_PREFIX = "深夜限定テキスト-";
 const LEGACY_VOICE_CHANNEL_PREFIX = "深夜限定通話-";
 
-export interface CoordinatorStub {
-  fetch(request: Request): Promise<Response>;
-}
+// Durable Objectなどのbinding型はwrangler typesが生成するglobal Envを
+// 利用し、設定とコードの型が別々に drift しないようにする。Secretは
+// Wranglerの生成対象外なので、アプリ側で必要な型だけを追加する。
+type GeneratedEnv = globalThis.Env;
 
-export interface CoordinatorNamespace {
-  getByName(name: string): CoordinatorStub;
-}
-
-export interface Env {
+export type Env = Omit<GeneratedEnv, "NIGHT_COORDINATOR"> & {
   DISCORD_BOT_TOKEN: string;
   DISCORD_GUILD_ID: string;
   DISCORD_PARENT_CATEGORY_ID: string;
@@ -40,9 +38,9 @@ export interface Env {
   DISCORD_MENTION_ROLE_ID: string;
   DISCORD_DEEP_ROLE_ID: string;
   DISCORD_ACTIVITY_DETAIL_CHANNEL_ID: string;
-  NIGHT_COORDINATOR?: CoordinatorNamespace;
+  NIGHT_COORDINATOR?: GeneratedEnv["NIGHT_COORDINATOR"];
   DRY_RUN?: string;
-}
+};
 
 export interface PermissionOverwrite {
   id: string;

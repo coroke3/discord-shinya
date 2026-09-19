@@ -6,6 +6,7 @@ import type {
 
 const DISCORD_API_BASE = "https://discord.com/api/v10";
 const MAX_RETRIES = 2;
+const DISCORD_REQUEST_TIMEOUT_MS = 15_000;
 
 export class DiscordApiError extends Error {
   constructor(
@@ -85,12 +86,16 @@ export async function createTextMessage(
   env: Env,
   channelId: string,
   content: string,
+  options: { nonce?: string } = {},
 ): Promise<void> {
   await discordRequest(env, `/channels/${channelId}/messages`, {
     method: "POST",
     body: JSON.stringify({
       content,
       allowed_mentions: { parse: [] },
+      ...(options.nonce
+        ? { nonce: options.nonce, enforce_nonce: true }
+        : {}),
     }),
   });
 }
@@ -98,11 +103,18 @@ export async function createTextMessage(
 export async function createAnnouncement(
   env: Env,
   channelId: string,
-  payload: { content: string; allowed_mentions: { parse: ["everyone"]; roles: string[] } },
+  payload: {
+    content: string;
+    allowed_mentions: { parse: ["everyone"]; roles: string[] };
+    nonce?: string;
+  },
 ): Promise<void> {
   await discordRequest(env, `/channels/${channelId}/messages`, {
     method: "POST",
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      ...payload,
+      ...(payload.nonce ? { enforce_nonce: true } : {}),
+    }),
   });
 }
 
@@ -170,14 +182,30 @@ async function discordRequest<T>(
     headers.set("Content-Type", "application/json");
   }
 
-  const response = await fetch(`${DISCORD_API_BASE}${path}`, {
-    ...init,
-    headers,
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DISCORD_REQUEST_TIMEOUT_MS);
+  let response: Response;
+  try {
+    response = await fetch(`${DISCORD_API_BASE}${path}`, {
+      ...init,
+      headers,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 
   if (response.ok) {
     const body = await response.text();
     return (body ? JSON.parse(body) : undefined) as T;
+  }
+
+  // エラー本文は操作にもログにも不要。読み捨てずに接続を保持すると、
+  // 再試行の多いAlarmでメモリ・接続資源を圧迫するため明示的に解放する。
+  try {
+    await response.body?.cancel();
+  } catch {
+    // 本文の解放失敗は元のDiscord APIエラーを隠さない。
   }
 
   if (response.status === 429) {
