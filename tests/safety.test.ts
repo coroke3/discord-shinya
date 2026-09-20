@@ -157,6 +157,43 @@ describe("破壊的操作の安全策", () => {
     expect(requests.filter((request) => request.method === "DELETE")).toHaveLength(10);
   });
 
+  it("ログ投稿が失敗しても10チャンネルの削除を継続する", async () => {
+    const requests: Array<{ method: string; url: string }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const method = init?.method ?? "GET";
+        const url = String(input);
+        requests.push({ method, url });
+        if (method === "GET") {
+          return new Response(
+            JSON.stringify([{
+              id: "channel-1",
+              type: 0,
+              name: "深夜限定テキスト1-08-30",
+              parent_id: liveTestEnv.DISCORD_PARENT_CATEGORY_ID,
+            }]),
+            { status: 200 },
+          );
+        }
+        if (method === "POST" && url.includes("/messages")) {
+          return new Response(null, { status: 403 });
+        }
+        if (method === "DELETE") {
+          return new Response(null, { status: 204 });
+        }
+        throw new Error(`Unexpected request: ${method} ${url}`);
+      }),
+    );
+
+    await closeNightChannels(liveTestEnv);
+
+    expect(requests.some((request) => request.method === "POST" && request.url.includes("/messages")))
+      .toBe(true);
+    expect(requests.some((request) => request.method === "DELETE" && request.url.endsWith("/channels/channel-1")))
+      .toBe(true);
+  });
+
   it("429のRetry-Afterを上限30秒に丸めず、Alarm用エラーとして返す", async () => {
     vi.stubGlobal(
       "fetch",

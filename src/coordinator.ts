@@ -226,12 +226,15 @@ export class NightCoordinator {
         return Response.json({ ok: false, error: "Invalid operation" }, { status: 400 });
       }
 
-      // Durable ObjectではwaitUntilに依存せず、未完了のI/Oがある間は
-      // アクティブな処理として実行を継続する。void + catchでイベント側の
-      // Promiseを取りこぼさず、同時に202をすぐ返してCronを長時間拘束しない。
-      void this.runOperation(operation, body.scheduledTime ?? Date.now()).catch((error) => {
+      // Cron側へ202をすぐ返しつつ、Durable Objectの実行コンテキストが
+      // 外部I/O完了前に終了しないようwaitUntilへ登録する。
+      const operationPromise = this.runOperation(
+        operation,
+        body.scheduledTime ?? Date.now(),
+      ).catch((error) => {
         this.logOperationError(operation, error);
       });
+      this.ctx.waitUntil(operationPromise);
       return Response.json({ ok: true, accepted: true }, { status: 202 });
     }
 
@@ -812,10 +815,10 @@ export class NightCoordinator {
     // re-running destructive phases.
     if (stage === "role_queue" || stage === "role_sync" || stage === "done") {
       this.setState("phase", "REPORTING");
-      await this.sendReports(dateJst);
-      if (!this.reportsAreComplete()) {
-        return;
-      }
+      // ログ投稿はベストエフォートにし、失敗してもチャンネル削除後の
+      // ロール同期・後処理を止めない。投稿だけは未完了フラグを残し、
+      // 次のAlarmで再試行する。
+      await this.sendReportsWithoutBlockingCleanup(dateJst);
     }
 
     if (stage === "flush") {
@@ -868,10 +871,9 @@ export class NightCoordinator {
 
     if (this.getState("close_stage") === "reports") {
       this.setState("phase", "REPORTING");
-      await this.sendReports(dateJst);
-      if (!this.reportsAreComplete()) {
-        return;
-      }
+      // close_stage=reportsに到達した時点で、チャンネル削除は完了済み。
+      // ログ出力の成否に関係なく、後続のロール同期へ進める。
+      await this.sendReportsWithoutBlockingCleanup(dateJst);
       this.setState("close_stage", "role_queue");
       await this.scheduleAlarmAt(Date.now() + 1_000);
       return;
@@ -904,6 +906,16 @@ export class NightCoordinator {
       await this.sendReportsInternal(dateJst);
     } finally {
       this.reportsInProgress = false;
+    }
+  }
+
+  private async sendReportsWithoutBlockingCleanup(dateJst: string): Promise<void> {
+    try {
+      await this.sendReports(dateJst);
+    } catch (error) {
+      // Discord API以外の予期せぬ投稿エラーでも、削除後の終了処理は
+      // 継続する。未送信フラグは残るため、最終化前のAlarmで再試行される。
+      this.logOperationError("reports", error);
     }
   }
 
@@ -964,6 +976,11 @@ export class NightCoordinator {
     if (this.getState("role_queue_initialized") === "1") {
       return;
     }
+
+    // 前日の権限エラーで残った古いキューを、当日の利用状況から
+    // 再構築する。成功済みのdeep_role_membersだけを基準にするため、
+    // staleなユーザーIDや古い日付の操作を持ち越さない。
+    this.ctx.storage.sql.exec("DELETE FROM role_sync_queue");
 
     const detected = this.rows<{ user_id: string }>(
       "SELECT user_id FROM daily_usage WHERE date_jst = ?",
@@ -1046,6 +1063,16 @@ export class NightCoordinator {
           continue;
         }
         this.logRoleSyncError(item.action, error);
+        if (error instanceof DiscordApiError && (error.status === 401 || error.status === 403)) {
+          // 権限・トークン設定の恒久エラーで、チャンネルの削除や翌日の
+          // 公開まで止めない。未処理キューは残し、次の日の終了処理で
+          // 現在の利用状況から再構築して再試行する。
+          this.setState("role_sync_status", "failed");
+          this.setState("role_sync_complete", "0");
+          this.deleteDailyUsage(dateJst);
+          this.setState("close_stage", "done");
+          return;
+        }
         await this.scheduleRetry("role_sync", error);
         return;
       }
@@ -1063,7 +1090,7 @@ export class NightCoordinator {
   }
 
   private async finalizeCloseIfReady(dateJst: string): Promise<void> {
-    const roleSyncComplete = this.getState("role_sync_status") === "complete";
+    const roleSyncComplete = this.roleSyncIsReadyForClose();
     const reportsComplete =
       this.getState("report_sent") === "1" && this.getState("detail_report_sent") === "1";
 
@@ -1301,6 +1328,7 @@ export class NightCoordinator {
         if (error instanceof DiscordRateLimitError) {
           throw error;
         }
+        this.logChannelDeleteError(item.channel_id, error);
         failures.push(item.channel_id);
       }
     }
@@ -1844,6 +1872,7 @@ export class NightCoordinator {
     const registered = this.registeredChannels();
     const phase = this.getPhase();
     const integrity = this.getState("metrics_integrity") || "degraded";
+    const roleSyncStatus = this.getState("role_sync_status") || "unknown";
     const stable = phase === "CLOSED" ||
       ((phase === "SEPARATED" || phase === "ALL_OPEN") &&
         registered.length === EXPECTED_CHANNEL_COUNT &&
@@ -1851,7 +1880,7 @@ export class NightCoordinator {
     return {
       // OPENING/CLOSING/REPORTING/ROLE_SYNC中や、チャンネル数・Gatewayが
       // 不完全な状態を200として返すと、監視側が障害を見逃してしまう。
-      ok: phase !== "BLOCKED" && integrity === "complete" && stable,
+      ok: phase !== "BLOCKED" && integrity === "complete" && stable && roleSyncStatus !== "failed",
       phase,
       dateJst: this.getState("date_jst") ?? null,
       gateway: {
@@ -1863,7 +1892,7 @@ export class NightCoordinator {
         registered: registered.length,
       },
       roleSync: {
-        status: this.getState("role_sync_status") ?? "unknown",
+        status: roleSyncStatus,
       },
     };
   }
@@ -1871,8 +1900,16 @@ export class NightCoordinator {
   private previousRoleSyncIsComplete(): boolean {
     const roleStatus = this.getState("role_sync_status");
     const queueCount = this.roleQueueCount();
+    if (roleStatus === "failed") {
+      return true;
+    }
     return roleStatus === null ||
       (roleStatus === "complete" && this.getState("role_sync_complete") !== "0" && queueCount === 0);
+  }
+
+  private roleSyncIsReadyForClose(): boolean {
+    const roleStatus = this.getState("role_sync_status");
+    return roleStatus === "complete" || roleStatus === "failed";
   }
 
   private reportsAreComplete(): boolean {
@@ -2188,17 +2225,31 @@ export class NightCoordinator {
       return;
     }
     if (error instanceof DiscordApiError) {
-      console.error(`${operation} Discord API error (${error.status})`);
+      console.error(
+        `${operation} Discord API error (${error.status}) ${error.method} ${error.path}`,
+      );
       return;
     }
     console.error(`${operation} failed`);
+  }
+
+  private logChannelDeleteError(channelId: string, error: unknown): void {
+    if (error instanceof DiscordApiError) {
+      console.error(
+        `channel delete failed (${error.status}) ${error.method} ${error.path}`,
+      );
+      return;
+    }
+    console.error(`channel delete failed for ${channelId}`);
   }
 
   private logReportError(kind: string, error: unknown): void {
     if (error instanceof DiscordRateLimitError) {
       console.error(`${kind} report is rate limited; retry scheduled`);
     } else if (error instanceof DiscordApiError) {
-      console.error(`${kind} report Discord API error (${error.status})`);
+      console.error(
+        `${kind} report Discord API error (${error.status}) ${error.method} ${error.path}`,
+      );
     } else {
       console.error(`${kind} report failed`);
     }
@@ -2208,7 +2259,9 @@ export class NightCoordinator {
     if (error instanceof DiscordRateLimitError) {
       console.error(`role ${action} is rate limited; retry scheduled`);
     } else if (error instanceof DiscordApiError) {
-      console.error(`role ${action} Discord API error (${error.status})`);
+      console.error(
+        `role ${action} Discord API error (${error.status}) ${error.method} ${error.path}`,
+      );
     } else {
       console.error(`role ${action} failed; the queue is retained`);
     }

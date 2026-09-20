@@ -99,7 +99,25 @@ const handler: ExportedHandler<Env> = {
     }
 
     const health = await coordinator.fetch(new Request("https://discord-shinya.internal/health"));
-    const payload = await health.json<unknown>();
+    let payload: Record<string, unknown> = {};
+    try {
+      const rawPayload = await health.json<unknown>();
+      if (rawPayload !== null && typeof rawPayload === "object") {
+        payload = rawPayload as Record<string, unknown>;
+      }
+    } catch {
+      return Response.json(
+        {
+          service: "discord-shinya",
+          ok: false,
+          configured: true,
+          timezone: TIME_ZONE,
+          error: "Coordinator health response was invalid",
+        },
+        { status: 503 },
+      );
+    }
+    const healthy = health.ok && payload.ok === true;
     return Response.json(
       {
         service: "discord-shinya",
@@ -111,9 +129,9 @@ const handler: ExportedHandler<Env> = {
           close: "0 23 * * *",
           configured: NIGHT_CRON,
         },
-        ...(payload as Record<string, unknown>),
+        ...payload,
       },
-      { status: health.ok ? 200 : 503 },
+      { status: healthy ? 200 : 503 },
     );
   },
 };
