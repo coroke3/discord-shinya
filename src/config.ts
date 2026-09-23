@@ -220,7 +220,7 @@ export function channelDefinitions(
       type: 0,
       kind: "normal_text",
       parent_id: parentCategoryId,
-      permission_overwrites: normalOverwrites(guildId, deepRoleId, botUserId),
+      permission_overwrites: stagingOverwrites(guildId, deepRoleId, botUserId),
     });
   });
   names.voice.forEach((name, index) => {
@@ -229,7 +229,7 @@ export function channelDefinitions(
       type: 2,
       kind: "normal_voice",
       parent_id: parentCategoryId,
-      permission_overwrites: normalOverwrites(guildId, deepRoleId, botUserId),
+      permission_overwrites: stagingOverwrites(guildId, deepRoleId, botUserId),
       user_limit: [0, 8, 4][index],
     });
   });
@@ -265,6 +265,24 @@ export function buildDeepPublicOverwrite(guildId: string): PermissionOverwrite {
   };
 }
 
+export function buildNormalPublicOverwrite(guildId: string): PermissionOverwrite {
+  return {
+    id: guildId,
+    type: 0,
+    allow: String(VIEW_CHANNEL_BIT | SEND_MESSAGES_BIT | CONNECT_BIT | SPEAK_BIT),
+    deny: String(THREAD_CREATION_BITS),
+  };
+}
+
+export function buildDeepRolePublicOverwrite(roleId: string): PermissionOverwrite {
+  return {
+    id: roleId,
+    type: 0,
+    allow: String(VIEW_CHANNEL_BIT | SEND_MESSAGES_BIT | CONNECT_BIT | SPEAK_BIT),
+    deny: String(THREAD_CREATION_BITS),
+  };
+}
+
 export function buildPrivateOverwrite(guildId: string): PermissionOverwrite {
   return {
     id: guildId,
@@ -287,15 +305,31 @@ export function buildMorningGreeting(): string {
   return "今日もお疲れ様でした！おはようございます！";
 }
 
+export interface ReportQualifiers {
+  messagePartial?: boolean;
+  usagePartial?: boolean;
+  voicePartial?: boolean;
+}
+
 export function buildMessageCountLog(
   messageCount: number,
   visitorCount = 0,
   bustleSeconds = 0,
+  qualifiers: ReportQualifiers = {},
 ): string {
+  const messageLabel = qualifiers.messagePartial
+    ? `今日のメッセージ数：${messageCount}件以上（一部欠測）`
+    : `今日のメッセージ数：${messageCount}件`;
+  const visitorLabel = qualifiers.usagePartial
+    ? `今日の来場者数：${visitorCount}人以上（一部欠測）`
+    : `今日の来場者数：${visitorCount}人`;
+  const bustleLabel = qualifiers.voicePartial
+    ? `賑わい：${bustleSeconds}（概算）`
+    : `賑わい：${bustleSeconds}`;
   return [
-    `今日のメッセージ数：${messageCount}件`,
-    `今日の来場者数：${visitorCount}人`,
-    `賑わい：${bustleSeconds}`,
+    messageLabel,
+    visitorLabel,
+    bustleLabel,
     buildMorningGreeting(),
   ].join("\n");
 }
@@ -319,95 +353,146 @@ export function buildAnnouncementPayload(roleId: string): {
 export function buildDetailReport(
   dateJst: string,
   buckets: readonly ActivityBucket[],
-  messageCountAvailable = true,
+  options: DetailReportOptions | boolean = {},
 ): string {
+  // 旧呼び出し側のbooleanも受け付ける。falseは旧来の「件数が不完全」
+  // を、新しい項目別partial表示へ変換する。
+  const reportOptions: DetailReportOptions = typeof options === "boolean"
+    ? { messagePartial: options === false }
+    : options;
+  const messagePartialMask = normalizePartialMask(reportOptions.messagePartialMask);
+  const voicePartialMask = normalizePartialMask(reportOptions.voicePartialMask);
+  const messageGloballyPartial = reportOptions.messagePartial === true;
+  const voiceGloballyPartial = reportOptions.voicePartial === true;
   const label = dateJst.length >= 7
     ? `${dateJst.slice(5, 7)}/${dateJst.slice(8, 10)}`
     : dateJst.replace("-", "/");
-  const lines = [`【賑わい内訳 ${label}】`, "", "時間帯 | 滞在人数 | ミュート率 | メッセージ数"];
+  const render = (graphLimit: number): string => {
+    const lines = [`【賑わい内訳 ${label}】`, "", "時間帯 | 滞在人数 | ミュート率 | メッセージ数"];
 
-  for (let index = 0; index < ACTIVITY_BUCKET_COUNT; index += 1) {
-    const bucket = buckets.find((candidate) => candidate.index === index);
-    const uniqueUsers = Math.max(0, Math.floor(bucket?.uniqueUsers ?? 0));
-    const mutedUsers = Math.min(
-      uniqueUsers,
-      Math.max(0, Math.floor(bucket?.mutedUsers ?? 0)),
-    );
-    const messageCount = Math.max(0, Math.floor(bucket?.messageCount ?? 0));
-    const messageLabel = messageCountAvailable ? `${messageCount}件` : "取得不可";
-    const startMinutes = index * ACTIVITY_BUCKET_MINUTES;
-    const endMinutes = startMinutes + ACTIVITY_BUCKET_MINUTES - 1;
+    for (let index = 0; index < ACTIVITY_BUCKET_COUNT; index += 1) {
+      const bucket = buckets.find((candidate) => candidate.index === index);
+      const uniqueUsers = nonNegativeInteger(bucket?.uniqueUsers);
+      const messageCount = nonNegativeInteger(bucket?.messageCount);
+      const messagePartial = messageGloballyPartial || Boolean(messagePartialMask & (1 << index));
+      const voicePartial = voiceGloballyPartial || Boolean(voicePartialMask & (1 << index));
+      const peopleLabel = `${uniqueUsers}人${voicePartial ? "※" : ""}`;
+      const muteLabel = `${formatMuteRatio(bucket)}${voicePartial ? "※" : ""}`;
+      const messageLabel = messagePartial ? `${messageCount}件以上※` : `${messageCount}件`;
+      const startMinutes = index * ACTIVITY_BUCKET_MINUTES;
+      const endMinutes = startMinutes + ACTIVITY_BUCKET_MINUTES - 1;
+      lines.push(
+        `${formatClock(startMinutes)}-${formatClock(endMinutes)} | ${peopleLabel} | ${muteLabel} | ${messageLabel}`,
+      );
+    }
+
+    lines.push("", "【滞在人数グラフ】");
+    for (let index = 0; index < ACTIVITY_BUCKET_COUNT; index += 1) {
+      const bucket = buckets.find((candidate) => candidate.index === index);
+      const uniqueUsers = nonNegativeInteger(bucket?.uniqueUsers);
+      const mutedUsers = Math.min(uniqueUsers, nonNegativeInteger(bucket?.mutedUsers));
+      const voicePartial = voiceGloballyPartial || Boolean(voicePartialMask & (1 << index));
+      const startMinutes = index * ACTIVITY_BUCKET_MINUTES;
+      const endMinutes = startMinutes + ACTIVITY_BUCKET_MINUTES - 1;
+      lines.push(
+        `${formatClock(startMinutes)}-${formatClock(endMinutes)} | ${personGraph(uniqueUsers, mutedUsers, graphLimit)}${voicePartial ? "※" : ""}`,
+      );
+    }
+
+    lines.push("", "【メッセージ数グラフ】");
+    for (let index = 0; index < ACTIVITY_BUCKET_COUNT; index += 1) {
+      const bucket = buckets.find((candidate) => candidate.index === index);
+      const messageCount = nonNegativeInteger(bucket?.messageCount);
+      const messagePartial = messageGloballyPartial || Boolean(messagePartialMask & (1 << index));
+      const startMinutes = index * ACTIVITY_BUCKET_MINUTES;
+      const endMinutes = startMinutes + ACTIVITY_BUCKET_MINUTES - 1;
+      lines.push(
+        `${formatClock(startMinutes)}-${formatClock(endMinutes)} | ${messageGraph(messageCount, messagePartial, graphLimit)}`,
+      );
+    }
+
     lines.push(
-      `${formatClock(startMinutes)}-${formatClock(endMinutes)} | ${uniqueUsers}人 | ${mutedUsers}/${uniqueUsers} | ${messageLabel}`,
+      "",
+      "※滞在人数グラフは■=ミュートなしの1人、□=枠内にミュート状態があった1人です。",
+      "※メッセージ数グラフは20件につき■1つです。長すぎる場合は末尾を…で省略します。",
     );
+    if (messagePartialMask !== 0 || voicePartialMask !== 0 || messageGloballyPartial || voiceGloballyPartial) {
+      lines.push("※ Gateway再接続の影響で、この時間帯は一部の値に欠測または概算を含む可能性があります。");
+    }
+
+    return lines.join("\n");
+  };
+
+  // 大きなサーバーや一時的な集計異常で数値の桁が増えても、Discordの
+  // 2000文字制限で詳細ログ全体が送信不能にならないよう、グラフだけを
+  // 段階的に短縮する。表の観測値とpartial表示は最後まで残す。
+  for (const graphLimit of [MAX_GRAPH_SYMBOLS_PER_ROW, 16, 12, 8, 4, 0]) {
+    const report = render(graphLimit);
+    if (report.length <= 2000) {
+      return report;
+    }
   }
 
-  lines.push("", "【滞在人数グラフ】");
-  for (let index = 0; index < ACTIVITY_BUCKET_COUNT; index += 1) {
-    const bucket = buckets.find((candidate) => candidate.index === index);
-    const uniqueUsers = Math.max(0, Math.floor(bucket?.uniqueUsers ?? 0));
-    const mutedUsers = Math.min(
-      uniqueUsers,
-      Math.max(0, Math.floor(bucket?.mutedUsers ?? 0)),
-    );
-    const startMinutes = index * ACTIVITY_BUCKET_MINUTES;
-    const endMinutes = startMinutes + ACTIVITY_BUCKET_MINUTES - 1;
-    lines.push(
-      `${formatClock(startMinutes)}-${formatClock(endMinutes)} | ${personGraph(uniqueUsers, mutedUsers)}`,
-    );
-  }
+  throw new Error("Activity detail report exceeds Discord's 2000-character limit");
+}
 
-  lines.push("", "【メッセージ数グラフ】");
-  for (let index = 0; index < ACTIVITY_BUCKET_COUNT; index += 1) {
-    const bucket = buckets.find((candidate) => candidate.index === index);
-    const messageCount = Math.max(0, Math.floor(bucket?.messageCount ?? 0));
-    const startMinutes = index * ACTIVITY_BUCKET_MINUTES;
-    const endMinutes = startMinutes + ACTIVITY_BUCKET_MINUTES - 1;
-    lines.push(
-      `${formatClock(startMinutes)}-${formatClock(endMinutes)} | ${messageGraph(messageCount, messageCountAvailable)}`,
-    );
-  }
+export interface DetailReportOptions {
+  messagePartialMask?: number;
+  voicePartialMask?: number;
+  messagePartial?: boolean;
+  voicePartial?: boolean;
+}
 
-  lines.push(
-    "",
-    "※滞在人数グラフは■=ミュートなしの1人、□=枠内にミュート状態があった1人です。",
-    "※メッセージ数グラフは20件につき■1つです。長すぎる場合は末尾を…で省略します。",
-  );
-
-  const report = lines.join("\n");
-  if (report.length > 2000) {
-    throw new Error("Activity detail report exceeds Discord's 2000-character limit");
+function normalizePartialMask(mask: number | undefined): number {
+  if (!Number.isSafeInteger(mask) || !mask || mask < 0) {
+    return 0;
   }
-  return report;
+  return mask & ((1 << ACTIVITY_BUCKET_COUNT) - 1);
+}
+
+function nonNegativeInteger(value: number | undefined): number {
+  const normalized = Number(value ?? 0);
+  return Number.isFinite(normalized) && normalized > 0 ? Math.floor(normalized) : 0;
 }
 
 const MAX_GRAPH_SYMBOLS_PER_ROW = 20;
 
-function personGraph(uniqueUsers: number, mutedUsers: number): string {
+function personGraph(uniqueUsers: number, mutedUsers: number, maxSymbols: number): string {
   if (uniqueUsers === 0) {
     return "（なし）";
   }
 
+  const graphLimit = Math.max(0, Math.floor(maxSymbols));
   const unmutedUsers = Math.max(0, uniqueUsers - mutedUsers);
-  const visibleUnmuted = Math.min(unmutedUsers, MAX_GRAPH_SYMBOLS_PER_ROW);
-  const remaining = MAX_GRAPH_SYMBOLS_PER_ROW - visibleUnmuted;
+  const visibleUnmuted = Math.min(unmutedUsers, graphLimit);
+  const remaining = graphLimit - visibleUnmuted;
   const visibleMuted = Math.min(mutedUsers, remaining);
   const graph = "■".repeat(visibleUnmuted) + "□".repeat(visibleMuted);
   return uniqueUsers > graph.length ? `${graph}…` : graph;
 }
 
-function messageGraph(messageCount: number, messageCountAvailable: boolean): string {
-  if (!messageCountAvailable) {
-    return "取得不可";
-  }
+function messageGraph(messageCount: number, partial: boolean, maxSymbols: number): string {
   if (messageCount === 0) {
-    return "（なし）";
+    return partial ? "（なし）※" : "（なし）";
   }
 
+  const graphLimit = Math.max(0, Math.floor(maxSymbols));
   const units = Math.ceil(messageCount / 20);
-  const visibleUnits = Math.min(units, MAX_GRAPH_SYMBOLS_PER_ROW);
+  const visibleUnits = Math.min(units, graphLimit);
   const graph = "■".repeat(visibleUnits);
-  return units > visibleUnits ? `${graph}…` : graph;
+  const shortened = units > visibleUnits ? `${graph}…` : graph;
+  return partial ? `${shortened}※` : shortened;
+}
+
+function formatMuteRatio(bucket: ActivityBucket | undefined): string {
+  const totalVoiceMs = Number(bucket?.totalVoiceMs ?? 0);
+  const safeTotalVoiceMs = Number.isFinite(totalVoiceMs) && totalVoiceMs > 0 ? totalVoiceMs : 0;
+  const mutedVoiceMs = Number(bucket?.mutedVoiceMs ?? 0);
+  const safeMutedVoiceMs = Number.isFinite(mutedVoiceMs) && mutedVoiceMs > 0
+    ? Math.min(safeTotalVoiceMs, mutedVoiceMs)
+    : 0;
+  const ratio = safeTotalVoiceMs > 0 ? (safeMutedVoiceMs / safeTotalVoiceMs) * 100 : 0;
+  return `${ratio.toFixed(1)}%`;
 }
 
 export function classifyManagedChannel(
@@ -494,24 +579,14 @@ export const CREATE_PUBLIC_THREADS_BIT = 2 ** 35;
 export const CREATE_PRIVATE_THREADS_BIT = 2 ** 36;
 export const THREAD_CREATION_BITS = CREATE_PUBLIC_THREADS_BIT + CREATE_PRIVATE_THREADS_BIT;
 
-function normalOverwrites(
+function stagingOverwrites(
   guildId: string,
   deepRoleId: string,
   botUserId?: string,
 ): PermissionOverwrite[] {
   const overwrites: PermissionOverwrite[] = [
-    {
-      id: guildId,
-      type: 0,
-      allow: String(VIEW_CHANNEL_BIT | SEND_MESSAGES_BIT | CONNECT_BIT | SPEAK_BIT),
-      deny: String(THREAD_CREATION_BITS),
-    },
-    {
-      id: deepRoleId,
-      type: 0,
-      allow: "0",
-      deny: String(VIEW_CHANNEL_BIT + THREAD_CREATION_BITS),
-    },
+    buildPrivateOverwrite(guildId),
+    buildRolePrivateOverwrite(deepRoleId),
   ];
   if (botUserId) {
     overwrites.push({
@@ -529,29 +604,7 @@ function deepOverwrites(
   deepRoleId: string,
   botUserId?: string,
 ): PermissionOverwrite[] {
-  const overwrites: PermissionOverwrite[] = [
-    {
-      id: guildId,
-      type: 0,
-      allow: "0",
-      deny: String(VIEW_CHANNEL_BIT + THREAD_CREATION_BITS),
-    },
-    {
-      id: deepRoleId,
-      type: 0,
-      allow: String(VIEW_CHANNEL_BIT | SEND_MESSAGES_BIT | CONNECT_BIT | SPEAK_BIT),
-      deny: String(THREAD_CREATION_BITS),
-    },
-  ];
-  if (botUserId) {
-    overwrites.push({
-      id: botUserId,
-      type: 1,
-      allow: String(VIEW_CHANNEL_BIT | SEND_MESSAGES_BIT | CONNECT_BIT | SPEAK_BIT),
-      deny: String(THREAD_CREATION_BITS),
-    });
-  }
-  return overwrites;
+  return stagingOverwrites(guildId, deepRoleId, botUserId);
 }
 
 function formatClock(totalMinutes: number): string {

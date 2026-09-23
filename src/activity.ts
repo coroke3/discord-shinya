@@ -48,6 +48,48 @@ export function activityBucketIndexAt(dateJst: string, timestampMs: number): num
   return bucketIndex;
 }
 
+/**
+ * Returns the bit mask of 30-minute buckets overlapped by a time interval.
+ * The end timestamp is exclusive, matching the interval arithmetic used by
+ * voice aggregation. This is used only for anonymous integrity metadata.
+ */
+export function activityBucketMaskBetween(
+  dateJst: string,
+  startedAt: number,
+  endedAt: number,
+): number {
+  const dayStart = japanDayStartMs(dateJst);
+  const nightEnd = japanNightEndMs(dateJst);
+  const start = Math.max(dayStart, startedAt);
+  const end = Math.min(nightEnd, endedAt);
+  if (end <= start) {
+    return 0;
+  }
+
+  let mask = 0;
+  for (let index = 0; index < ACTIVITY_BUCKET_COUNT; index += 1) {
+    const bucketStart = dayStart + index * HALF_HOUR_MS;
+    const bucketEnd = bucketStart + HALF_HOUR_MS;
+    if (start < bucketEnd && end > bucketStart) {
+      mask |= 1 << index;
+    }
+  }
+  return mask;
+}
+
+/** Returns the Discord Snowflake creation timestamp without retaining the ID. */
+export function discordSnowflakeTimestampMs(messageId: string): number | null {
+  if (!/^\d+$/.test(messageId)) {
+    return null;
+  }
+  try {
+    const timestamp = Number((BigInt(messageId) >> 22n) + 1_420_070_400_000n);
+    return Number.isSafeInteger(timestamp) && timestamp >= 0 ? timestamp : null;
+  } catch {
+    return null;
+  }
+}
+
 export function isUnmutedVoiceState(selfMute: unknown, mute: unknown): boolean {
   return selfMute === false && mute === false;
 }
@@ -92,15 +134,23 @@ export function splitVoiceInterval(
 export function weightedBustleSeconds(buckets: readonly ActivityBucket[]): number {
   let weightedMs = 0;
   for (const bucket of buckets) {
-    const unmutedMs = Math.max(0, bucket.totalVoiceMs - bucket.mutedVoiceMs);
-    weightedMs += bucket.mutedVoiceMs + unmutedMs * 2;
+    const totalVoiceMs = nonNegativeFinite(bucket.totalVoiceMs);
+    const mutedVoiceMs = Math.min(totalVoiceMs, nonNegativeFinite(bucket.mutedVoiceMs));
+    const unmutedMs = totalVoiceMs - mutedVoiceMs;
+    weightedMs += mutedVoiceMs + unmutedMs * 2;
   }
   return Math.floor(weightedMs / 1000);
 }
 
 export function muteRatioPercent(bucket: Pick<ActivityBucket, "totalVoiceMs" | "mutedVoiceMs">): number {
-  if (bucket.totalVoiceMs <= 0) {
+  const totalVoiceMs = nonNegativeFinite(bucket.totalVoiceMs);
+  if (totalVoiceMs <= 0) {
     return 0;
   }
-  return (bucket.mutedVoiceMs / bucket.totalVoiceMs) * 100;
+  const mutedVoiceMs = Math.min(totalVoiceMs, nonNegativeFinite(bucket.mutedVoiceMs));
+  return (mutedVoiceMs / totalVoiceMs) * 100;
+}
+
+function nonNegativeFinite(value: number): number {
+  return Number.isFinite(value) && value > 0 ? value : 0;
 }

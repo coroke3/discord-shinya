@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   activityBucketIndexAt,
+  activityBucketMaskBetween,
+  discordSnowflakeTimestampMs,
   japanDayStartMs,
   isUnmutedVoiceState,
+  muteRatioPercent,
   splitVoiceInterval,
   weightedBustleSeconds,
 } from "../src/activity";
@@ -44,6 +47,40 @@ describe("匿名の通話集計", () => {
     ]);
   });
 
+  it("Gateway gapの重なる枠だけをpartial maskにする", () => {
+    const dayStart = japanDayStartMs("2026-08-29");
+    expect(activityBucketMaskBetween(
+      "2026-08-29",
+      dayStart + 1 * 60 * 60 * 1000 + 12 * 60_000,
+      dayStart + 1 * 60 * 60 * 1000 + 18 * 60_000,
+    )).toBe(1 << 2);
+    expect(activityBucketMaskBetween(
+      "2026-08-29",
+      dayStart + 1 * 60 * 60 * 1000 + 55 * 60_000,
+      dayStart + 2 * 60 * 60 * 1000 + 5 * 60_000,
+    )).toBe((1 << 3) | (1 << 4));
+  });
+
+  it("Discord Snowflakeからmessage作成時刻を復元する", () => {
+    const timestamp = japanDayStartMs("2026-08-29") + 15 * 60_000;
+    const id = ((BigInt(timestamp) - 1_420_070_400_000n) << 22n).toString();
+    expect(discordSnowflakeTimestampMs(id)).toBe(timestamp);
+    expect(activityBucketIndexAt("2026-08-29", discordSnowflakeTimestampMs(id) ?? 0)).toBe(0);
+
+    const nightEnd = japanDayStartMs("2026-08-29") + 8 * 60 * 60 * 1000;
+    const delayedBeforeCutoff = ((BigInt(nightEnd - 1) - 1_420_070_400_000n) << 22n).toString();
+    const afterCutoff = ((BigInt(nightEnd) - 1_420_070_400_000n) << 22n).toString();
+    expect(activityBucketIndexAt(
+      "2026-08-29",
+      discordSnowflakeTimestampMs(delayedBeforeCutoff) ?? 0,
+    )).toBe(15);
+    expect(activityBucketIndexAt(
+      "2026-08-29",
+      discordSnowflakeTimestampMs(afterCutoff) ?? 0,
+    )).toBeNull();
+    expect(discordSnowflakeTimestampMs("not-a-snowflake")).toBeNull();
+  });
+
   it("ミュート1倍、発話中2倍を合算して秒で切り捨てる", () => {
     expect(weightedBustleSeconds([
       {
@@ -63,5 +100,20 @@ describe("匿名の通話集計", () => {
         messageCount: 0,
       },
     ])).toBe(4);
+  });
+
+  it("異常な集計値をログへ伝播させない", () => {
+    const bucket = {
+      totalVoiceMs: Number.NaN,
+      mutedVoiceMs: Number.POSITIVE_INFINITY,
+    };
+    expect(muteRatioPercent(bucket)).toBe(0);
+    expect(weightedBustleSeconds([{
+      index: 0,
+      ...bucket,
+      uniqueUsers: 0,
+      mutedUsers: 0,
+      messageCount: 0,
+    }])).toBe(0);
   });
 });

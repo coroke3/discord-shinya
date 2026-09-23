@@ -81,6 +81,9 @@ describe("破壊的操作の安全策", () => {
         if (method === "POST" && url.includes("/messages")) {
           return new Response(null, { status: 204 });
         }
+        if (method === "PUT" && url.includes("/permissions/")) {
+          return new Response(null, { status: 204 });
+        }
         throw new Error(`Unexpected request: ${method} ${url}`);
       }),
     );
@@ -114,6 +117,8 @@ describe("破壊的操作の安全策", () => {
       expect.stringContaining("/channels/created-channel-0/messages"),
       expect.stringContaining("/channels/created-channel-6/messages"),
     ]);
+    expect(requests.filter((request) => request.method === "PUT" && request.url.includes("/permissions/")))
+      .toHaveLength(6);
     expect(requests.some((request) => request.method === "DELETE")).toBe(false);
   });
 

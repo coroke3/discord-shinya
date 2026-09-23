@@ -51,6 +51,13 @@ describe("新しい深夜チャンネル構成", () => {
       allow: "0",
       deny: String(1024 + THREAD_CREATION_BITS),
     });
+    expect(definitions.find((definition) => definition.kind === "normal_text")?.permission_overwrites)
+      .toContainEqual({
+        id: "99",
+        type: 0,
+        allow: "0",
+        deny: String(1024 + THREAD_CREATION_BITS),
+      });
   });
 
   it("深層チャンネルだけ別カテゴリへ配置する", () => {
@@ -124,8 +131,8 @@ describe("新しい深夜チャンネル構成", () => {
     ]);
     expect(report).toContain("【賑わい内訳 08/29】");
     expect(report).toContain("時間帯 | 滞在人数 | ミュート率 | メッセージ数");
-    expect(report).toContain("00:00-00:29 | 3人 | 1/3 | 41件");
-    expect(report).not.toContain("25.0%");
+    expect(report).toContain("00:00-00:29 | 3人 | 25.0% | 41件");
+    expect(report).not.toContain("1/3");
     expect(report).toContain("【滞在人数グラフ】");
     expect(report).toContain("00:00-00:29 | ■■□");
     expect(report).toContain("【メッセージ数グラフ】");
@@ -136,9 +143,37 @@ describe("新しい深夜チャンネル構成", () => {
     expect(report).not.toContain("user");
     expect(report.length).toBeLessThan(2000);
 
-    const degradedReport = buildDetailReport("2026-08-29", [], false);
-    expect(degradedReport).toContain("00:00-00:29 | 0人 | 0/0 | 取得不可");
-    expect(degradedReport).toContain("00:00-00:29 | 取得不可");
+    const partialReport = buildDetailReport("2026-08-29", [], {
+      messagePartialMask: 1 << 2,
+      voicePartialMask: 1 << 2,
+    });
+    expect(partialReport).toContain("01:00-01:29 | 0人※ | 0.0%※ | 0件以上※");
+    expect(partialReport).toContain("Gateway再接続の影響");
+    expect(partialReport).not.toContain("取得不可");
+    const allPartialReport = buildDetailReport("2026-08-29", [], {
+      messagePartialMask: 0xffff,
+      voicePartialMask: 0xffff,
+    });
+    expect(allPartialReport.length).toBeLessThan(2000);
+    const largeReport = buildDetailReport(
+      "2026-08-29",
+      Array.from({ length: 16 }, (_, index) => ({
+        index,
+        totalVoiceMs: Number.MAX_SAFE_INTEGER,
+        mutedVoiceMs: Number.MAX_SAFE_INTEGER,
+        uniqueUsers: Number.MAX_SAFE_INTEGER,
+        mutedUsers: Number.MAX_SAFE_INTEGER,
+        messageCount: Number.MAX_SAFE_INTEGER,
+      })),
+    );
+    expect(largeReport.length).toBeLessThanOrEqual(2000);
+    expect(buildMessageCountLog(123, 45, 67890, {
+      messagePartial: true,
+      usagePartial: true,
+      voicePartial: true,
+    })).toBe(
+      "今日のメッセージ数：123件以上（一部欠測）\n今日の来場者数：45人以上（一部欠測）\n賑わい：67890（概算）\n今日もお疲れ様でした！おはようございます！",
+    );
   });
 
   it("新しいSecretが欠けている場合は値をログに出さずに報告する", () => {

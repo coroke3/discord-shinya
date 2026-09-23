@@ -43,4 +43,18 @@ describe("ヘルスチェック", () => {
     const response = await fetchHealth({ ok: true, phase: "CLOSED" });
     expect(response.status).toBe(200);
   });
+
+  it("Coordinatorのintegrityとpartial maskをそのまま公開する", async () => {
+    const response = await fetchHealth({
+      ok: false,
+      phase: "ALL_OPEN",
+      gateway: { connected: true, reconnecting: true, resumePending: true },
+      integrity: { message: "complete", usage: "complete", voice: "partial" },
+      partialBuckets: { messageMask: 0, voiceMask: 8 },
+    });
+    expect(await response.json()).toMatchObject({
+      integrity: { voice: "partial" },
+      partialBuckets: { voiceMask: 8 },
+    });
+  });
 });

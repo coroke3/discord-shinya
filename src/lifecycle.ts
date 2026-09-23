@@ -1,6 +1,7 @@
 import {
   assertConfig,
   buildAnnouncementPayload,
+  buildNormalPublicOverwrite,
   channelDefinitions,
   classifyManagedChannel,
   isDryRun,
@@ -16,6 +17,7 @@ import {
   deleteChannel,
   DiscordApiError,
   listGuildChannels,
+  putChannelPermission,
 } from "./discord";
 
 /**
@@ -65,6 +67,19 @@ export async function openNightChannels(env: Env, scheduledTime: number): Promis
       firstDeepText.id,
       buildAnnouncementPayload(env.DISCORD_MENTION_ROLE_ID),
     );
+    for (const definition of definitions.filter(
+      (candidate) => candidate.kind === "normal_text" || candidate.kind === "normal_voice",
+    )) {
+      const channel = created.find((candidate) => candidate.name === definition.name);
+      if (!channel) {
+        throw new Error(`Normal channel was not created: ${definition.name}`);
+      }
+      await putChannelPermission(
+        env,
+        channel.id,
+        buildNormalPublicOverwrite(env.DISCORD_GUILD_ID),
+      );
+    }
   } catch (error) {
     await rollbackCreatedChannels(env, created);
     throw error;
