@@ -343,4 +343,88 @@ describe("NightCoordinator Gateway復旧", () => {
       vi.useRealTimers();
     }
   });
+
+  it("旧版の全体degradedはRESUMED成功後にmessage/usageを回復する", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-29T01:15:00+09:00"));
+    try {
+      const storage = new MemoryStorage();
+      storage.sql.state.set("phase", "ALL_OPEN");
+      storage.sql.state.set("date_jst", "2026-08-29");
+      storage.sql.state.set("metrics_integrity", "degraded");
+      // 旧単一flagを全枠へ拡張した後の永続状態を再現する。
+      storage.sql.state.set("message_integrity", "partial");
+      storage.sql.state.set("usage_integrity", "partial");
+      storage.sql.state.set("voice_integrity", "partial");
+      storage.sql.state.set("message_partial_mask", "65535");
+      storage.sql.state.set("voice_partial_mask", "65535");
+      storage.sql.state.set("gateway_connected", "1");
+      storage.sql.state.set("gateway_session_id", "legacy-session");
+      storage.sql.state.set("gateway_last_sequence", "42");
+      const coordinator = new NightCoordinator({
+        storage,
+        waitUntil: vi.fn(),
+      } as unknown as DurableObjectState, env);
+      const socket = attachOpenSocket(coordinator);
+      storage.sql.state.set("gateway_gap_started_at", String(Date.now() - 60_000));
+      storage.sql.state.set("gateway_recovery_pending", "1");
+      storage.sql.state.set("gateway_resume_pending", "1");
+      storage.sql.state.set("voice_replay_mode", "1");
+
+      const handleGatewayMessage = (coordinator as unknown as {
+        handleGatewayMessage: (socket: WebSocket, raw: string) => Promise<void>;
+      }).handleGatewayMessage.bind(coordinator);
+      await handleGatewayMessage(socket, JSON.stringify({
+        op: 0,
+        t: "RESUMED",
+        s: 43,
+        d: null,
+      }));
+
+      expect(storage.sql.state.get("message_integrity")).toBe("complete");
+      expect(storage.sql.state.get("usage_integrity")).toBe("complete");
+      expect(storage.sql.state.get("message_partial_mask")).toBe("0");
+      expect(storage.sql.state.get("legacy_integrity_recovery_pending")).toBe("0");
+      // 旧版ではvoice gapの時刻を保存していないため、全体partialを
+      // message replay成功だけで解除しない。
+      expect(storage.sql.state.get("voice_integrity")).toBe("partial");
+      expect(Number(storage.sql.state.get("voice_partial_mask"))).toBe(0xffff);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("RESUME不能なら切断区間と重なるmessage/voice枠だけpartialにする", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-29T02:05:00+09:00"));
+    try {
+      const storage = new MemoryStorage();
+      const coordinator = createCoordinator(storage);
+      const socket = attachOpenSocket(coordinator);
+      const dayStart = japanDayStartMs("2026-08-29");
+      storage.sql.state.set("gateway_gap_started_at", String(dayStart + 1 * 60 * 60_000 + 55 * 60_000));
+      storage.sql.state.set("gateway_recovery_pending", "1");
+
+      const handleGatewayMessage = (coordinator as unknown as {
+        handleGatewayMessage: (socket: WebSocket, raw: string) => Promise<void>;
+      }).handleGatewayMessage.bind(coordinator);
+      await handleGatewayMessage(socket, JSON.stringify({
+        op: 0,
+        t: "READY",
+        s: 44,
+        d: {
+          session_id: "new-session",
+          resume_gateway_url: "wss://gateway.discord.gg",
+        },
+      }));
+
+      const expectedMask = (1 << 3) | (1 << 4);
+      expect(Number(storage.sql.state.get("message_partial_mask"))).toBe(expectedMask);
+      expect(Number(storage.sql.state.get("voice_partial_mask"))).toBe(expectedMask);
+      expect(storage.sql.state.get("message_integrity")).toBe("partial");
+      expect(storage.sql.state.get("usage_integrity")).toBe("partial");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

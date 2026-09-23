@@ -199,6 +199,7 @@ const DAILY_EPHEMERAL_STATE_KEYS = [
   "voice_integrity",
   "message_partial_mask",
   "voice_partial_mask",
+  "legacy_integrity_recovery_pending",
   "gateway_state",
   "gateway_gap_started_at",
   "gateway_recovery_pending",
@@ -522,6 +523,7 @@ export class NightCoordinator {
     this.setState("voice_integrity", "complete");
     this.setState("message_partial_mask", "0");
     this.setState("voice_partial_mask", "0");
+    this.setState("legacy_integrity_recovery_pending", "0");
     this.setState("gateway_state", "connecting");
     this.setState("gateway_gap_started_at", "");
     this.setState("gateway_recovery_pending", "0");
@@ -1978,6 +1980,11 @@ export class NightCoordinator {
         this.setState("voice_replay_mode", "0");
         this.setState("voice_replay_snapshot_required", "0");
       }
+      console.log(
+        hadGatewayGap
+          ? "Discord Gateway IDENTIFY completed; the unrecoverable gap remains partial"
+          : "Discord Gateway IDENTIFY completed",
+      );
       this.gatewayIdentifyOnly = false;
       this.setState("gateway_connect_started_at", "");
       this.setState("gateway_connected", "1");
@@ -2036,6 +2043,8 @@ export class NightCoordinator {
         this.markGatewayGapPartial(Date.now(), false);
         this.reconcileVoiceReplay(dateJst, Date.now(), false);
       }
+      this.recoverLegacyMessageIntegrityAfterResume();
+      console.log("Discord Gateway RESUME succeeded; message dispatch replay completed");
       this.setState("gateway_gap_started_at", "");
       this.setState("gateway_recovery_pending", "0");
       this.setState("voice_replay_mode", "0");
@@ -2212,6 +2221,7 @@ export class NightCoordinator {
   private async handleInvalidSession(canResume: boolean): Promise<void> {
     this.beginGatewayGap();
     if (!canResume) {
+      console.warn("Discord Gateway session cannot resume; switching to IDENTIFY");
       this.gatewayIdentifyOnly = true;
       this.setState("gateway_session_id", "");
       this.setState("gateway_last_sequence", "");
@@ -2462,6 +2472,7 @@ export class NightCoordinator {
         : now;
       this.setState("gateway_gap_started_at", String(normalizedStart));
       this.clearVoiceReplayStates();
+      console.warn("Discord Gateway connection interrupted; attempting RESUME");
     }
     this.setState("gateway_state", "reconnecting");
     this.setState("gateway_connected", "0");
@@ -2479,6 +2490,7 @@ export class NightCoordinator {
     const startAt = Number(this.getState("gateway_gap_started_at"));
     if (!dateJst || !Number.isFinite(startAt)) {
       if (reidentify) {
+        this.setState("legacy_integrity_recovery_pending", "0");
         this.addPartialMask("message_partial_mask", FULL_ACTIVITY_BUCKET_MASK);
         this.addPartialMask("voice_partial_mask", FULL_ACTIVITY_BUCKET_MASK);
         this.markIntegrityPartial("message");
@@ -2490,13 +2502,18 @@ export class NightCoordinator {
 
     const mask = activityBucketMaskBetween(dateJst, startAt, endAt);
     if (reidentify && mask !== 0) {
+      // 旧版の不明なdegradedに加えて、新コード上でも回収不能なgapが
+      // 確定した場合は、その既知の欠測を後続RESUMEDで消さない。
+      this.setState("legacy_integrity_recovery_pending", "0");
       this.addPartialMask("message_partial_mask", mask);
       this.markIntegrityPartial("message");
       this.markIntegrityPartial("usage");
+      console.warn("Discord Gateway RESUME failed; affected message and visitor metrics are partial");
     }
     this.addPartialMask("voice_partial_mask", mask);
     if (mask !== 0) {
       this.markIntegrityPartial("voice");
+      console.warn("Discord Gateway gap overlaps voice buckets; voice metrics are partial");
     }
     this.syncLegacyMetricsIntegrity();
   }
@@ -2942,6 +2959,14 @@ export class NightCoordinator {
   }
 
   private markIntegrityPartial(kind: "message" | "usage" | "voice"): void {
+    if (
+      (kind === "message" || kind === "usage") &&
+      this.getState("legacy_integrity_recovery_pending") === "1"
+    ) {
+      // 旧版由来のflagを回復できるのは、その後に新しい既知欠測が
+      // 発生していない場合だけに限定する。
+      this.setState("legacy_integrity_recovery_pending", "0");
+    }
     this.setState(`${kind}_integrity`, "partial");
     this.syncLegacyMetricsIntegrity();
   }
@@ -3051,6 +3076,13 @@ export class NightCoordinator {
         channel_id TEXT PRIMARY KEY
       );
     `);
+    const storedMessageIntegrity = this.getState("message_integrity");
+    const storedUsageIntegrity = this.getState("usage_integrity");
+    const storedVoiceIntegrity = this.getState("voice_integrity");
+    const storedMessageMask = this.getState("message_partial_mask");
+    const storedVoiceMask = this.getState("voice_partial_mask");
+    const migrationVersion = this.getState("integrity_migration_version");
+
     if (this.getState("phase") === null) {
       this.setState("phase", INITIAL_PHASE);
     }
@@ -3058,6 +3090,21 @@ export class NightCoordinator {
       this.setState("metrics_integrity", "complete");
     }
     const legacyDegraded = this.getState("metrics_integrity") === "degraded";
+    const legacyDegradedState = legacyDegraded && migrationVersion === null && (
+      (storedMessageIntegrity === null && storedUsageIntegrity === null &&
+        storedVoiceIntegrity === null && storedMessageMask === null && storedVoiceMask === null) ||
+      (storedMessageIntegrity === "partial" && storedUsageIntegrity === "partial" &&
+        storedVoiceIntegrity === "partial" && storedMessageMask === String(FULL_ACTIVITY_BUCKET_MASK) &&
+        storedVoiceMask === String(FULL_ACTIVITY_BUCKET_MASK))
+    );
+    if (legacyDegradedState) {
+      // 旧版の単一flagを最初のbucket対応版が全16枠へ展開した状態を識別する。
+      // RESUMEDならDiscord replayでmessage/visitorを回復できるが、旧版では
+      // voiceのgap時刻を保存していないためvoice側の保守的なpartialは残す。
+      this.setState("legacy_integrity_recovery_pending", "1");
+    } else if (this.getState("legacy_integrity_recovery_pending") === null) {
+      this.setState("legacy_integrity_recovery_pending", "0");
+    }
     if (this.getState("message_integrity") === null) {
       this.setState("message_integrity", legacyDegraded ? "partial" : "complete");
     }
@@ -3097,8 +3144,25 @@ export class NightCoordinator {
     if (this.getState("role_sync_complete") === null) {
       this.setState("role_sync_complete", "1");
     }
+    if (migrationVersion === null) {
+      this.setState("integrity_migration_version", "1");
+    }
 
     this.schemaInitialized = true;
+  }
+
+  private recoverLegacyMessageIntegrityAfterResume(): void {
+    if (this.getState("legacy_integrity_recovery_pending") !== "1") {
+      return;
+    }
+    // 旧版の単一degraded flagには欠測のbucket情報がなく、RESUME成功後も
+    // message/visitorを全日partialのまま残していた。Discord replayの完了を
+    // 確認できた場合だけこの旧flag由来の不確実性を解除する。
+    this.setState("message_integrity", "complete");
+    this.setState("usage_integrity", "complete");
+    this.setState("message_partial_mask", "0");
+    this.setState("legacy_integrity_recovery_pending", "0");
+    this.syncLegacyMetricsIntegrity();
   }
 
   private recoverGatewayIfNeeded(): void {

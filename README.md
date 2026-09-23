@@ -217,6 +217,8 @@ GUILDS | GUILD_VOICE_STATES | GUILD_MESSAGES = 641
 
 RESUMEできず新規IDENTIFYになった場合だけ、切断区間と重なる枠を`message_partial_mask`・`voice_partial_mask`でpartial扱いにします。メッセージは観測できた件数を残して「以上（一部欠測）」と表示し、通話は時間ベースのミュート率を「概算」と表示します。VOICE_STATE_UPDATEはreplay中の受信時刻を滞在時間として使わず、最終状態をreconcileします。
 
+旧版の単一`metrics_integrity=degraded`から更新した場合、RESUMED成功後はDiscordのdispatch replayで回収できたメッセージ数・来場者数の旧partialを解除します。旧版は通話gapの開始時刻を保存していないため、通話のpartialは保守的に維持します。Gatewayのログには接続・RESUME・IDENTIFY・partial確定の状態だけを出し、Discord payloadやユーザー情報は記録しません。
+
 08:00はチャンネルを先にロックし、最大30秒のdrain期間を設けてからGatewayを終了します。その間に届いた08:00前のSnowflakeメッセージは当日分へ回収します。新規チャンネルはBotだけが見えるstaging権限で10チャンネルを作成・登録し、全件完了後に通常6チャンネルを公開します。深層4チャンネルは03:00まで非公開です。
 
 ## 安全策
