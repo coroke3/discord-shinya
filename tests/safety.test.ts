@@ -5,6 +5,7 @@ import {
   createTextMessage,
   DiscordApiError,
   DiscordRateLimitError,
+  listGuildChannels,
   normalizeGatewayUrl,
 } from "../src/discord";
 import type { Env } from "../src/config";
@@ -25,19 +26,25 @@ const dryRunEnv: Env = {
 };
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
 describe("破壊的操作の安全策", () => {
   it("RESUME用Gateway URLにAPIバージョンとJSON形式を付ける", () => {
-    const normalized = normalizeGatewayUrl("wss://gateway.example.test/?v=9&encoding=etf");
+    const normalized = normalizeGatewayUrl("wss://gateway.discord.gg/?v=9&encoding=etf");
     expect(normalized).not.toBeNull();
-    const url = new URL(normalized ?? "wss://invalid.example.test");
+    const url = new URL(normalized ?? "wss://invalid.discord.gg");
     expect(url.protocol).toBe("wss:");
     expect(url.searchParams.get("v")).toBe("10");
     expect(url.searchParams.get("encoding")).toBe("json");
-    expect(normalizeGatewayUrl("https://gateway.example.test")).toBeNull();
+    expect(normalizeGatewayUrl("wss://gateway-us-east1-b.discord.gg/?v=10")).not.toBeNull();
+    expect(normalizeGatewayUrl("https://gateway.discord.gg")).toBeNull();
+    expect(normalizeGatewayUrl("wss://gateway.discord.gg.attacker.example")).toBeNull();
+    expect(normalizeGatewayUrl("wss://attacker.example/gateway")).toBeNull();
+    expect(normalizeGatewayUrl("wss://user:secret@gateway.discord.gg")).toBeNull();
+    expect(normalizeGatewayUrl("wss://gateway.discord.gg:8443")).toBeNull();
   });
 
   it("DRY_RUNではDiscord APIを一切呼ばない", async () => {
@@ -212,6 +219,123 @@ describe("破壊的操作の安全策", () => {
       .rejects.toSatisfy((error: unknown) =>
         error instanceof DiscordRateLimitError && error.retryAfterMs === 61_500,
       );
+  });
+
+  it("異常に大きいRetry-AfterはAlarmに使える有限の待機時間へ置き換える", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(null, {
+        status: 429,
+        headers: { "Retry-After": "1e308" },
+      })),
+    );
+
+    await expect(createTextMessage(liveTestEnv, "123456789012345678", "test"))
+      .rejects.toSatisfy((error: unknown) =>
+        error instanceof DiscordRateLimitError && error.retryAfterMs === 300_000,
+      );
+  });
+
+  it("Retry-Afterが欠けている429ではX-RateLimit-Reset-Afterを使う", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(null, {
+        status: 429,
+        headers: { "X-RateLimit-Reset-After": "2.75" },
+      })),
+    );
+
+    await expect(createTextMessage(liveTestEnv, "123456789012345678", "test"))
+      .rejects.toSatisfy((error: unknown) =>
+        error instanceof DiscordRateLimitError && error.retryAfterMs === 2_750,
+      );
+  });
+
+  it("429の待機ヘッダーが両方欠けている場合は最低待機時間を使う", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(null, { status: 429 })),
+    );
+
+    await expect(createTextMessage(liveTestEnv, "123456789012345678", "test"))
+      .rejects.toSatisfy((error: unknown) =>
+        error instanceof DiscordRateLimitError && error.retryAfterMs === 1_000,
+      );
+  });
+
+  it("Discordの応答本文が止まってもリクエストタイムアウトで中断する", async () => {
+    vi.useFakeTimers();
+    let capturedSignal: AbortSignal | null | undefined;
+    let releaseBody: ((body: string) => void) | undefined;
+    let markBodyReadStarted: (() => void) | undefined;
+    const bodyReadStarted = new Promise<void>((resolve) => {
+      markBodyReadStarted = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        capturedSignal = init?.signal;
+        const response = new Response(null, {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+        vi.spyOn(response, "text").mockImplementation(() => {
+          markBodyReadStarted?.();
+          return new Promise<string>((resolve, reject) => {
+            releaseBody = resolve;
+            capturedSignal?.addEventListener("abort", () => {
+              reject(new DOMException("Aborted", "AbortError"));
+            }, { once: true });
+          });
+        });
+        return response;
+      }),
+    );
+
+    const outcome = listGuildChannels(liveTestEnv)
+      .then(() => "resolved" as const, () => "rejected" as const);
+    // ヘッダー受信後に本文の読み込みで停止している状態を確実に作る。
+    await bodyReadStarted;
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    const timedOut = capturedSignal?.aborted === true;
+    // 修正前の挙動でもテスト自体がハングしないよう、本文を解放してから結果を確認。
+    if (!timedOut) {
+      releaseBody?.("{}");
+    }
+    const result = await outcome;
+
+    expect(timedOut).toBe(true);
+    expect(result).toBe("rejected");
+  });
+
+  it("成功済みのメッセージ投稿は応答本文を待たずに完了する", async () => {
+    vi.useFakeTimers();
+    let capturedSignal: AbortSignal | null | undefined;
+    let responseText: ReturnType<typeof vi.spyOn> | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        capturedSignal = init?.signal;
+        const response = new Response(null, { status: 201 });
+        responseText = vi.spyOn(response, "text").mockImplementation(() =>
+          new Promise<string>((_resolve, reject) => {
+            capturedSignal?.addEventListener("abort", () => {
+              reject(new DOMException("Aborted", "AbortError"));
+            }, { once: true });
+          })
+        );
+        return response;
+      }),
+    );
+
+    const outcome = createTextMessage(liveTestEnv, "123456789012345678", "test")
+      .then(() => "resolved" as const, () => "rejected" as const);
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    expect(await outcome).toBe("resolved");
+    expect(capturedSignal?.aborted).toBe(true);
+    expect(responseText).not.toHaveBeenCalled();
   });
 
   it("投稿再試行用のnonceで同じ通知を二重作成しない", async () => {

@@ -7,6 +7,7 @@ import {
   channelNames,
   getConfigIssues,
   isManagedChannel,
+  japanIsoDateKey,
   japanDateKey,
   operationForScheduledTime,
   THREAD_CREATION_BITS,
@@ -20,6 +21,7 @@ describe("新しい深夜チャンネル構成", () => {
     expect(operationForScheduledTime(Date.UTC(2026, 7, 28, 18, 0))).toBe("open_deep");
     expect(operationForScheduledTime(Date.UTC(2026, 7, 28, 23, 0))).toBe("close");
     expect(operationForScheduledTime(Date.UTC(2026, 7, 28, 16, 0))).toBeNull();
+    expect(() => japanIsoDateKey(Number.MAX_SAFE_INTEGER)).toThrow("Invalid timestamp");
   });
 
   it("通常6つと深層4つの名前を生成する", () => {
@@ -106,7 +108,7 @@ describe("新しい深夜チャンネル構成", () => {
 
   it("終了ログを指定フォーマットで出力する", () => {
     expect(buildMessageCountLog(123, 45, 67890)).toBe(
-      "今日のメッセージ数：123件\n今日の来場者数：45人\n賑わい：67890\n今日もお疲れ様でした！おはようございます！",
+      "今日のメッセージ数：123件\n今日の来場者数：45人\n賑わい：678.9\n今日もお疲れ様でした！おはようございます！",
     );
   });
 
@@ -131,15 +133,21 @@ describe("新しい深夜チャンネル構成", () => {
     ]);
     expect(report).toContain("【賑わい内訳 08/29】");
     expect(report).toContain("時間帯 | 滞在人数 | ミュート率 | メッセージ数");
-    expect(report).toContain("00:00-00:29 | 3人 | 25.0% | 41件");
-    expect(report).not.toContain("1/3");
+    expect(report).toContain("00:00-00:29 | 3人 | 1/3 | 41件");
+    expect(report).toContain("00:30-00:59 | 2人 | 0/1 | 20件");
+    expect(report).toContain("ミュート率は枠内にミュート状態があった人数/滞在人数を約分して表示します。");
     expect(report).toContain("【滞在人数グラフ】");
-    expect(report).toContain("00:00-00:29 | ■■□");
+    expect(report).toContain("時間 | 人数 | グラフ");
+    expect(report).toContain("00:00-00:29 | 3人 | ■■□");
+    expect(report).toContain("00:30-00:59 | 2人 | ■■");
     expect(report).toContain("【メッセージ数グラフ】");
-    expect(report).toContain("00:00-00:29 | ■■■");
-    expect(report).toContain("00:30-00:59 | ■");
-    expect(report).toContain("■=ミュートなしの1人、□=枠内にミュート状態があった1人");
-    expect(report).toContain("20件につき■1つ");
+    expect(report).toContain("時間 | 件数 | グラフ");
+    expect(report).toContain("00:00-00:29 | 41件 | ■■■");
+    expect(report).toContain("00:30-00:59 | 20件 | ■");
+    expect(report).toContain("凡例：滞在人数グラフは■=ミュートなしの1人、□=枠内にミュート状態があった1人");
+    expect(report).toContain("凡例：メッセージ数グラフは20件につき■1つ");
+    expect(report.match(/```/g)).toHaveLength(4);
+    expect(report).not.toContain("※");
     expect(report).not.toContain("user");
     expect(report.length).toBeLessThan(2000);
 
@@ -147,8 +155,13 @@ describe("新しい深夜チャンネル構成", () => {
       messagePartialMask: 1 << 2,
       voicePartialMask: 1 << 2,
     });
-    expect(partialReport).toContain("01:00-01:29 | 0人※ | 0.0%※ | 0件以上※");
-    expect(partialReport).toContain("Gateway再接続の影響");
+    expect(partialReport).toContain("01:00-01:29 | 0人 | 0/0 | 0件以上");
+    expect(partialReport).toContain("01:00-01:29 | 0人 |");
+    expect(partialReport).toContain("01:00-01:29 | 0件以上 |");
+    expect(partialReport).not.toContain("（なし）");
+    expect(partialReport).toContain("注意：一部の集計に欠測または概算があります。");
+    expect(partialReport).not.toContain("※");
+    expect(partialReport.match(/注意：/g)).toHaveLength(1);
     expect(partialReport).not.toContain("取得不可");
     const allPartialReport = buildDetailReport("2026-08-29", [], {
       messagePartialMask: 0xffff,
@@ -167,12 +180,13 @@ describe("新しい深夜チャンネル構成", () => {
       })),
     );
     expect(largeReport.length).toBeLessThanOrEqual(2000);
+    expect(largeReport).toContain("約9010兆人");
+    expect(largeReport).toContain("数値が大きい時間帯は概数表示です。");
     expect(buildMessageCountLog(123, 45, 67890, {
       messagePartial: true,
       usagePartial: true,
-      voicePartial: true,
     })).toBe(
-      "今日のメッセージ数：123件以上（一部欠測）\n今日の来場者数：45人以上（一部欠測）\n賑わい：67890（概算）\n今日もお疲れ様でした！おはようございます！",
+      "今日のメッセージ数：123件以上（一部欠測）\n今日の来場者数：45人以上（一部欠測）\n賑わい：678.9\n今日もお疲れ様でした！おはようございます！",
     );
   });
 

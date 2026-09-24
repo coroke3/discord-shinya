@@ -147,6 +147,12 @@ const GATEWAY_RESUME_CLOSE_CODE = 4000;
 const GATEWAY_WATCHDOG_MS = 30_000;
 const GATEWAY_RECONNECT_INITIAL_DELAY_MS = 500;
 const GATEWAY_DRAIN_GRACE_MS = 30_000;
+const GATEWAY_NIGHT_CLOSE_WAIT_MS = 2_000;
+const MAX_ALARM_TIMESTAMP_MS = 8_640_000_000_000_000;
+const JST_OFFSET_MS = 9 * 60 * 60 * 1_000;
+// OPENINGは最大33回（channel list・作成・通知・権限公開）の外部subrequestを
+// 使うため、失敗時のロールバックは3件に絞り、再試行込みでも50件未満にする。
+const MAX_OPENING_ROLLBACK_OPERATIONS_PER_ALARM = 3;
 const FULL_ACTIVITY_BUCKET_MASK = (1 << ACTIVITY_BUCKET_COUNT) - 1;
 const NON_RESUMABLE_GATEWAY_CODES = new Set([
   4003,
@@ -222,6 +228,7 @@ export class NightCoordinator {
   private readonly env: Env;
   private gatewaySocket: WebSocket | null = null;
   private gatewayHeartbeatTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly gatewayClosePromises = new WeakMap<WebSocket, Promise<void>>();
   private gatewayHeartbeatIntervalMs = 0;
   private gatewayAwaitingAck = false;
   private gatewayIdentifyOnly = false;
@@ -288,7 +295,8 @@ export class NightCoordinator {
         scheduledTime !== undefined &&
         (typeof scheduledTime !== "number" ||
           !Number.isSafeInteger(scheduledTime) ||
-          scheduledTime < 0)
+          scheduledTime < 0 ||
+          !Number.isFinite(new Date(scheduledTime + JST_OFFSET_MS).getTime()))
       ) {
         return Response.json({ ok: false, error: "Invalid scheduledTime" }, { status: 400 });
       }
@@ -370,7 +378,11 @@ export class NightCoordinator {
     scheduledTime: number,
   ): Promise<void> {
     try {
-      if (!Number.isSafeInteger(scheduledTime) || scheduledTime < 0) {
+      if (
+        !Number.isSafeInteger(scheduledTime) ||
+        scheduledTime < 0 ||
+        !Number.isFinite(new Date(scheduledTime + JST_OFFSET_MS).getTime())
+      ) {
         throw new Error("Invalid scheduledTime");
       }
       assertConfig(this.env);
@@ -778,7 +790,7 @@ export class NightCoordinator {
         try {
           // 失敗時は次の再試行で厳密な管理対象を改めて掃除する。
           // キュー処理が未完了でもOPENINGのまま再利用しない。
-          rollbackComplete = await this.deleteChannels(created);
+          rollbackComplete = await this.rollbackOpeningChannels(created);
         } catch (rollbackError) {
           this.logOperationError("opening rollback", rollbackError);
         }
@@ -919,6 +931,15 @@ export class NightCoordinator {
 
   private async beginClose(dateJst: string): Promise<void> {
     const phase = this.getPhase();
+    const currentDate = this.getState("date_jst");
+    if (
+      currentDate &&
+      /^\d{4}-\d{2}-\d{2}$/.test(currentDate) &&
+      currentDate > dateJst
+    ) {
+      // 遅延・重複した前日closeが新しい夜のチャンネルを閉じないようにする。
+      return;
+    }
     // 作成処理や深層公開処理の途中でCLOSINGへ遷移すると、後から到着した
     // 外部APIの完了処理が公開状態を復活させ得る。完了を待ってから閉じる。
     if (
@@ -936,7 +957,7 @@ export class NightCoordinator {
       console.error("Closing superseded an unfinished opening operation");
     }
 
-    if (phase === "CLOSED" && this.getState("date_jst") !== dateJst) {
+    if (phase === "CLOSED" && currentDate !== dateJst) {
       return;
     }
     if (phase === "CLOSED" && this.getState("close_stage") === "done") {
@@ -1031,10 +1052,10 @@ export class NightCoordinator {
     }
 
     if (this.getState("close_stage") === "gateway") {
-      // 前段のAlarm待ち中に最後のGatewayイベントが追加された場合も、
-      // ソケット参照を破棄する前にもう一度処理を待つ。
-      await this.waitForGatewayEventChain();
-      this.closeGatewayForNight();
+      // 先にclose frameを送り、close callbackがdispatch chainの末尾へ
+      // 積まれるまでsocket参照を保つ。08:00 cutoff前の遅延messageが
+      // close直前に届いた場合も、sequence確定後に削除へ進む。
+      await this.closeGatewayForNight();
       this.setState("close_stage", "delete");
       await this.scheduleAlarmAt(Date.now() + 1_000);
       return;
@@ -1141,7 +1162,7 @@ export class NightCoordinator {
     const delay = Number.isSafeInteger(requestedDelay) && requestedDelay >= 0
       ? Math.max(1_000, requestedDelay)
       : 300_000;
-    const retryAt = Math.min(Number.MAX_SAFE_INTEGER, Date.now() + delay);
+    const retryAt = Math.min(MAX_ALARM_TIMESTAMP_MS, Date.now() + delay);
     this.setState(key, String(retryAt));
     await this.scheduleAlarmAt(retryAt);
   }
@@ -1198,7 +1219,6 @@ export class NightCoordinator {
         const summary = buildMessageCountLog(messageCount, visitorCount, bustle, {
           messagePartial,
           usagePartial,
-          voicePartial,
         });
         await createTextMessage(
           this.env,
@@ -1575,6 +1595,11 @@ export class NightCoordinator {
     return this.processChannelDeleteQueue();
   }
 
+  private async rollbackOpeningChannels(channelIds: readonly string[]): Promise<boolean> {
+    this.enqueueChannelDeletes(channelIds);
+    return this.processChannelDeleteQueue(MAX_OPENING_ROLLBACK_OPERATIONS_PER_ALARM);
+  }
+
   private enqueueChannelDeletes(channelIds: readonly string[]): void {
     // 無料枠のsubrequest上限を超えないよう、削除対象をSQLiteキューへ積む。
     for (const channelId of channelIds) {
@@ -1585,14 +1610,16 @@ export class NightCoordinator {
     }
   }
 
-  private async processChannelDeleteQueue(): Promise<boolean> {
+  private async processChannelDeleteQueue(
+    operationLimit = MAX_CHANNEL_DELETE_OPERATIONS_PER_ALARM,
+  ): Promise<boolean> {
     const queue = this.rows<ChannelDeleteQueueItem>(
       `SELECT q.channel_id, m.name AS expected_name, m.kind AS expected_kind
        FROM channel_delete_queue q
        LEFT JOIN managed_channels m ON m.channel_id = q.channel_id
        ORDER BY q.channel_id
        LIMIT ?`,
-      MAX_CHANNEL_DELETE_OPERATIONS_PER_ALARM,
+      operationLimit,
     );
     if (queue.length === 0) {
       return true;
@@ -1711,6 +1738,11 @@ export class NightCoordinator {
     try {
       const socket = new WebSocket(url);
       this.gatewaySocket = socket;
+      let resolveClose!: () => void;
+      const closePromise = new Promise<void>((resolve) => {
+        resolveClose = resolve;
+      });
+      this.gatewayClosePromises.set(socket, closePromise);
       this.setState("gateway_connect_started_at", String(Date.now()));
       this.setState("gateway_state", "connecting");
       socket.addEventListener("message", (event) => {
@@ -1718,6 +1750,7 @@ export class NightCoordinator {
       });
       socket.addEventListener("close", (event) => {
         this.enqueueGatewayClose(socket, event.code);
+        resolveClose();
       });
       socket.addEventListener("error", () => {
         // The close event drives the reconnect path. Payloads and error bodies
@@ -1740,6 +1773,17 @@ export class NightCoordinator {
     }
     this.logGatewayError(error);
     const drainActive = this.gatewayDrainIsActive();
+    if (
+      phase === "CLOSING" &&
+      !drainActive &&
+      (this.getState("close_stage") === "drain" ||
+        this.getState("close_stage") === "gateway")
+    ) {
+      // cutoff後に最後のdispatch処理が失敗した場合は、再接続しても削除前に
+      // 安全に回収しきれない。完全値を出さず、夜間分を保守的にpartialにする。
+      this.markAllActivityPartial();
+      return;
+    }
     if (this.isTrackingPhase() || drainActive) {
       this.beginGatewayGap();
       this.disconnectGatewayForResume();
@@ -2272,20 +2316,14 @@ export class NightCoordinator {
     await this.scheduleGatewayReconnect();
   }
 
-  private closeGatewayForNight(): void {
+  private async closeGatewayForNight(): Promise<void> {
     this.clearHeartbeatTimer();
     this.gatewayAwaitingAck = false;
     const socket = this.gatewaySocket;
-    this.gatewaySocket = null;
     this.setState("gateway_connected", "0");
     this.setState("gateway_state", "closed");
     this.setState("gateway_connect_started_at", "");
-    this.setState("gateway_resume_pending", "0");
-    this.setState("gateway_recovery_pending", "0");
-    this.setState("gateway_session_id", "");
-    this.setState("gateway_resume_url", "");
-    this.setState("gateway_last_sequence", "");
-    this.gatewayIdentifyOnly = true;
+    let closeObserved = true;
     if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
       try {
         socket.close(GATEWAY_NIGHT_CLOSE_CODE, "night window ended");
@@ -2293,6 +2331,41 @@ export class NightCoordinator {
         // A socket can transition to CLOSED between the state check and close.
       }
     }
+    if (socket) {
+      const closePromise = this.gatewayClosePromises.get(socket);
+      // CLOSEDはclose callbackのdispatch完了を意味しない。イベントがまだ
+      // chainへ積まれていない場合にsession/sequenceを先に消さないよう、
+      // readyStateに関係なくclose eventそのものを待つ。
+      if (closePromise) {
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        closeObserved = await Promise.race([
+          closePromise.then(() => true),
+          new Promise<boolean>((resolve) => {
+            timeout = setTimeout(() => resolve(false), GATEWAY_NIGHT_CLOSE_WAIT_MS);
+          }),
+        ]);
+        if (timeout !== undefined) {
+          clearTimeout(timeout);
+        }
+      }
+      await this.waitForGatewayEventChain();
+      if (!closeObserved) {
+        this.markAllActivityPartial();
+      }
+      if (this.gatewaySocket === socket) {
+        this.gatewaySocket = null;
+      }
+      this.gatewayClosePromises.delete(socket);
+    }
+    // close event chainを処理するまでsequence/sessionを維持する。
+    // 先に消すと、終了待ち中に届いた過去sequenceの重複dispatchを
+    // 判定できず、メッセージ数を二重加算する可能性がある。
+    this.setState("gateway_resume_pending", "0");
+    this.setState("gateway_recovery_pending", "0");
+    this.setState("gateway_session_id", "");
+    this.setState("gateway_resume_url", "");
+    this.setState("gateway_last_sequence", "");
+    this.gatewayIdentifyOnly = true;
   }
 
   private disconnectGatewayForResume(): void {
@@ -2347,8 +2420,11 @@ export class NightCoordinator {
       await this.scheduleGatewayReconnect();
       return;
     }
-    const delay = error instanceof DiscordRateLimitError
-      ? Math.max(1_000, error.retryAfterMs)
+    const requestedDelay = error instanceof DiscordRateLimitError
+      ? error.retryAfterMs
+      : 300_000;
+    const delay = Number.isSafeInteger(requestedDelay) && requestedDelay >= 0
+      ? Math.max(1_000, requestedDelay)
       : 300_000;
     const phase = this.getPhase();
     // pending_operationはAlarmが再開する公開処理の意図として使う。
@@ -2366,7 +2442,7 @@ export class NightCoordinator {
     if (canKeepPendingOperation) {
       this.setState("pending_operation", operation);
     }
-    await this.scheduleAlarmAt(Date.now() + delay);
+    await this.scheduleAlarmAt(Math.min(MAX_ALARM_TIMESTAMP_MS, Date.now() + delay));
   }
 
   private scheduleAlarmAt(timestamp: number): Promise<void> {
@@ -2969,6 +3045,14 @@ export class NightCoordinator {
     }
     this.setState(`${kind}_integrity`, "partial");
     this.syncLegacyMetricsIntegrity();
+  }
+
+  private markAllActivityPartial(): void {
+    this.addPartialMask("message_partial_mask", FULL_ACTIVITY_BUCKET_MASK);
+    this.addPartialMask("voice_partial_mask", FULL_ACTIVITY_BUCKET_MASK);
+    this.markIntegrityPartial("message");
+    this.markIntegrityPartial("usage");
+    this.markIntegrityPartial("voice");
   }
 
   private syncLegacyMetricsIntegrity(): void {

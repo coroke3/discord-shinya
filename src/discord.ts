@@ -8,6 +8,11 @@ const DISCORD_API_BASE = "https://discord.com/api/v10";
 const MAX_RETRIES = 2;
 const DISCORD_REQUEST_TIMEOUT_MS = 15_000;
 
+interface DiscordRequestOptions {
+  attempt?: number;
+  readResponseBody?: boolean;
+}
+
 export class DiscordApiError extends Error {
   constructor(
     public readonly status: number,
@@ -58,9 +63,12 @@ export async function createGuildChannel(
 }
 
 export async function deleteChannel(env: Env, channelId: string): Promise<void> {
-  await discordRequest<DiscordChannel>(env, `/channels/${channelId}`, {
-    method: "DELETE",
-  });
+  await discordRequest<void>(
+    env,
+    `/channels/${channelId}`,
+    { method: "DELETE" },
+    { readResponseBody: false },
+  );
 }
 
 export async function putChannelPermission(
@@ -79,6 +87,7 @@ export async function putChannelPermission(
         type: overwrite.type,
       }),
     },
+    { readResponseBody: false },
   );
 }
 
@@ -88,16 +97,21 @@ export async function createTextMessage(
   content: string,
   options: { nonce?: string } = {},
 ): Promise<void> {
-  await discordRequest(env, `/channels/${channelId}/messages`, {
-    method: "POST",
-    body: JSON.stringify({
-      content,
-      allowed_mentions: { parse: [] },
-      ...(options.nonce
-        ? { nonce: options.nonce, enforce_nonce: true }
-        : {}),
-    }),
-  });
+  await discordRequest<void>(
+    env,
+    `/channels/${channelId}/messages`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        content,
+        allowed_mentions: { parse: [] },
+        ...(options.nonce
+          ? { nonce: options.nonce, enforce_nonce: true }
+          : {}),
+      }),
+    },
+    { readResponseBody: false },
+  );
 }
 
 export async function createAnnouncement(
@@ -109,13 +123,18 @@ export async function createAnnouncement(
     nonce?: string;
   },
 ): Promise<void> {
-  await discordRequest(env, `/channels/${channelId}/messages`, {
-    method: "POST",
-    body: JSON.stringify({
-      ...payload,
-      ...(payload.nonce ? { enforce_nonce: true } : {}),
-    }),
-  });
+  await discordRequest<void>(
+    env,
+    `/channels/${channelId}/messages`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        ...payload,
+        ...(payload.nonce ? { enforce_nonce: true } : {}),
+      }),
+    },
+    { readResponseBody: false },
+  );
 }
 
 export async function addGuildMemberRole(
@@ -130,6 +149,7 @@ export async function addGuildMemberRole(
       method: "PUT",
       body: "",
     },
+    { readResponseBody: false },
   );
 }
 
@@ -144,6 +164,7 @@ export async function removeGuildMemberRole(
     {
       method: "DELETE",
     },
+    { readResponseBody: false },
   );
 }
 
@@ -153,12 +174,22 @@ export function initialGatewayUrl(): string {
 
 /**
  * DiscordがREADYで返すRESUME用URLにも、接続時と同じバージョン・形式を
- * 必ず付ける。異常な値は保存・接続に使わず、初期Gatewayへフォールバックする。
+ * 必ず付ける。Bot tokenを送る接続先はGatewayドメインだけに限定し、異常な値は
+ * 保存・接続に使わず初期Gatewayへフォールバックする。
  */
 export function normalizeGatewayUrl(value: string): string | null {
   try {
     const url = new URL(value);
-    if (url.protocol !== "wss:" || !url.hostname) {
+    const isDiscordGatewayHost =
+      /^gateway(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?\.discord\.gg$/.test(url.hostname);
+    if (
+      url.protocol !== "wss:" ||
+      !isDiscordGatewayHost ||
+      url.username !== "" ||
+      url.password !== "" ||
+      (url.port !== "" && url.port !== "443") ||
+      url.hash !== ""
+    ) {
       return null;
     }
     url.searchParams.set("v", "10");
@@ -173,8 +204,10 @@ async function discordRequest<T>(
   env: Env,
   path: string,
   init: RequestInit,
-  attempt = 0,
+  options: DiscordRequestOptions = {},
 ): Promise<T> {
+  const attempt = options.attempt ?? 0;
+  const readResponseBody = options.readResponseBody ?? true;
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bot ${env.DISCORD_BOT_TOKEN}`);
   headers.set("User-Agent", "discord-shinya/2.0");
@@ -185,23 +218,35 @@ async function discordRequest<T>(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), DISCORD_REQUEST_TIMEOUT_MS);
   let response: Response;
+  let responseBody: string | undefined;
   try {
     response = await fetch(`${DISCORD_API_BASE}${path}`, {
       ...init,
       headers,
       signal: controller.signal,
     });
+    // fetch()はヘッダー受信時に解決する。本文の読み込みもタイムアウト対象に
+    // 含め、ヘッダーだけ返って本文が止まった場合に処理が永久待機するのを防ぐ。
+    if (response.ok) {
+      if (readResponseBody) {
+        responseBody = await response.text();
+      } else {
+        // 投稿・削除・権限変更の成功判定に本文は不要。読むだけの本文待ちで
+        // 成功済みのPOSTを失敗扱いにすると、上位の再試行が重複投稿を生む。
+        controller.abort();
+      }
+    }
   } finally {
     clearTimeout(timeout);
   }
 
   if (response.ok) {
-    const body = await response.text();
-    return (body ? JSON.parse(body) : undefined) as T;
+    return (responseBody ? JSON.parse(responseBody) : undefined) as T;
   }
 
   // エラー本文は操作にもログにも不要。読み捨てずに接続を保持すると、
   // 再試行の多いAlarmでメモリ・接続資源を圧迫するため明示的に解放する。
+  controller.abort();
   try {
     await response.body?.cancel();
   } catch {
@@ -223,7 +268,7 @@ async function discordRequest<T>(
   const method = (init.method ?? "GET").toUpperCase();
   if (response.status >= 500 && isRetryableMethod(method) && attempt < MAX_RETRIES) {
     await sleep(250 * 2 ** attempt);
-    return discordRequest<T>(env, path, init, attempt + 1);
+    return discordRequest<T>(env, path, init, { ...options, attempt: attempt + 1 });
   }
 
   // Do not include Discord's response body: it is unnecessary for operation
@@ -236,14 +281,22 @@ function isRetryableMethod(method: string): boolean {
 }
 
 function parseRetryAfterMs(response: Response): number {
-  const retryAfter = Number(response.headers.get("Retry-After"));
-  if (Number.isFinite(retryAfter) && retryAfter >= 0) {
-    return Math.ceil(retryAfter * 1000);
+  const retryAfterHeader = response.headers.get("Retry-After");
+  if (retryAfterHeader !== null && retryAfterHeader.trim() !== "") {
+    const retryAfter = Number(retryAfterHeader);
+    if (Number.isFinite(retryAfter) && retryAfter >= 0) {
+      const retryAfterMs = Math.ceil(retryAfter * 1000);
+      return Number.isSafeInteger(retryAfterMs) ? retryAfterMs : 300_000;
+    }
   }
 
-  const resetAfter = Number(response.headers.get("X-RateLimit-Reset-After"));
-  if (Number.isFinite(resetAfter) && resetAfter >= 0) {
-    return Math.ceil(resetAfter * 1000);
+  const resetAfterHeader = response.headers.get("X-RateLimit-Reset-After");
+  if (resetAfterHeader !== null && resetAfterHeader.trim() !== "") {
+    const resetAfter = Number(resetAfterHeader);
+    if (Number.isFinite(resetAfter) && resetAfter >= 0) {
+      const resetAfterMs = Math.ceil(resetAfter * 1000);
+      return Number.isSafeInteger(resetAfterMs) ? resetAfterMs : 300_000;
+    }
   }
 
   return 1_000;

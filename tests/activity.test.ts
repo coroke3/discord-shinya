@@ -24,6 +24,12 @@ describe("匿名の通話集計", () => {
     expect(activityBucketIndexAt(dateJst, nightEnd)).toBeNull();
   });
 
+  it("不正な暦日を正規化せず拒否し、無効なイベント時刻は集計対象外にする", () => {
+    expect(() => japanDayStartMs("2026-02-30")).toThrow("Invalid JST date");
+    expect(() => japanDayStartMs("2026-2-03")).toThrow("Invalid JST date");
+    expect(activityBucketIndexAt("2026-08-29", Number.NaN)).toBeNull();
+  });
+
   it("ミュート判定はself_muteとmuteが両方falseのときだけ発話中にする", () => {
     expect(isUnmutedVoiceState(false, false)).toBe(true);
     expect(isUnmutedVoiceState(true, false)).toBe(false);

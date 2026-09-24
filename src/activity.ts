@@ -24,11 +24,26 @@ export interface ActivitySegment {
 }
 
 export function japanDayStartMs(dateJst: string): number {
-  const [year, month, day] = dateJst.split("-").map(Number);
-  if (![year, month, day].every(Number.isFinite)) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateJst);
+  if (!match) {
     throw new Error(`Invalid JST date: ${dateJst}`);
   }
-  return Date.UTC(year, month - 1, day) - JST_OFFSET_MS;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const utcDate = new Date(0);
+  utcDate.setUTCHours(0, 0, 0, 0);
+  utcDate.setUTCFullYear(year, month - 1, day);
+  if (
+    utcDate.getUTCFullYear() !== year ||
+    utcDate.getUTCMonth() !== month - 1 ||
+    utcDate.getUTCDate() !== day
+  ) {
+    throw new Error(`Invalid JST date: ${dateJst}`);
+  }
+
+  return utcDate.getTime() - JST_OFFSET_MS;
 }
 
 export function japanNightEndMs(dateJst: string): number {
@@ -40,6 +55,9 @@ export function japanNightEndMs(dateJst: string): number {
  * 00:00-08:00 JST window.
  */
 export function activityBucketIndexAt(dateJst: string, timestampMs: number): number | null {
+  if (!Number.isFinite(timestampMs)) {
+    return null;
+  }
   const offset = timestampMs - japanDayStartMs(dateJst);
   const bucketIndex = Math.floor(offset / HALF_HOUR_MS);
   if (bucketIndex < 0 || bucketIndex >= ACTIVITY_BUCKET_COUNT) {

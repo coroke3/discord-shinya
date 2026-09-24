@@ -151,6 +151,9 @@ export function isDryRun(env: Pick<Env, "DRY_RUN">): boolean {
 /** Returns the JST calendar date in YYYY-MM-DD form. */
 export function japanIsoDateKey(timestampMs: number): string {
   const japanTime = new Date(timestampMs + 9 * 60 * 60 * 1000);
+  if (!Number.isSafeInteger(timestampMs) || !Number.isFinite(japanTime.getTime())) {
+    throw new Error(`Invalid timestamp: ${timestampMs}`);
+  }
   const year = japanTime.getUTCFullYear();
   const month = String(japanTime.getUTCMonth() + 1).padStart(2, "0");
   const day = String(japanTime.getUTCDate()).padStart(2, "0");
@@ -308,7 +311,6 @@ export function buildMorningGreeting(): string {
 export interface ReportQualifiers {
   messagePartial?: boolean;
   usagePartial?: boolean;
-  voicePartial?: boolean;
 }
 
 export function buildMessageCountLog(
@@ -323,9 +325,7 @@ export function buildMessageCountLog(
   const visitorLabel = qualifiers.usagePartial
     ? `今日の来場者数：${visitorCount}人以上（一部欠測）`
     : `今日の来場者数：${visitorCount}人`;
-  const bustleLabel = qualifiers.voicePartial
-    ? `賑わい：${bustleSeconds}（概算）`
-    : `賑わい：${bustleSeconds}`;
+  const bustleLabel = `賑わい：${bustleSeconds / 100}`;
   return [
     messageLabel,
     visitorLabel,
@@ -367,7 +367,11 @@ export function buildDetailReport(
   const label = dateJst.length >= 7
     ? `${dateJst.slice(5, 7)}/${dateJst.slice(8, 10)}`
     : dateJst.replace("-", "/");
-  const render = (graphLimit: number): string => {
+  const hasCompactedQuantities = buckets.some((bucket) =>
+    nonNegativeInteger(bucket.uniqueUsers) >= 10_000 ||
+    nonNegativeInteger(bucket.messageCount) >= 10_000
+  );
+  const render = (graphLimit: number, compactGraphCounts: boolean): string => {
     const lines = [`【賑わい内訳 ${label}】`, "", "時間帯 | 滞在人数 | ミュート率 | メッセージ数"];
 
     for (let index = 0; index < ACTIVITY_BUCKET_COUNT; index += 1) {
@@ -375,61 +379,83 @@ export function buildDetailReport(
       const uniqueUsers = nonNegativeInteger(bucket?.uniqueUsers);
       const messageCount = nonNegativeInteger(bucket?.messageCount);
       const messagePartial = messageGloballyPartial || Boolean(messagePartialMask & (1 << index));
-      const voicePartial = voiceGloballyPartial || Boolean(voicePartialMask & (1 << index));
-      const peopleLabel = `${uniqueUsers}人${voicePartial ? "※" : ""}`;
-      const muteLabel = `${formatMuteRatio(bucket)}${voicePartial ? "※" : ""}`;
-      const messageLabel = messagePartial ? `${messageCount}件以上※` : `${messageCount}件`;
+      const peopleLabel = `${uniqueUsers}人`;
+      const muteLabel = formatMuteRatio(bucket);
+      const displayedPeople = compactGraphCounts
+        ? compactGraphQuantity(uniqueUsers, "人")
+        : peopleLabel;
+      const displayedMessageCount = compactGraphCounts
+        ? compactGraphQuantity(messageCount, "件")
+        : `${messageCount}件`;
+      const messageLabel = messagePartial
+        ? `${displayedMessageCount}以上`
+        : displayedMessageCount;
       const startMinutes = index * ACTIVITY_BUCKET_MINUTES;
       const endMinutes = startMinutes + ACTIVITY_BUCKET_MINUTES - 1;
       lines.push(
-        `${formatClock(startMinutes)}-${formatClock(endMinutes)} | ${peopleLabel} | ${muteLabel} | ${messageLabel}`,
+        `${formatClock(startMinutes)}-${formatClock(endMinutes)} | ${displayedPeople} | ${muteLabel} | ${messageLabel}`,
       );
     }
 
-    lines.push("", "【滞在人数グラフ】");
+    lines.push("", "【滞在人数グラフ】", "```", "時間 | 人数 | グラフ");
     for (let index = 0; index < ACTIVITY_BUCKET_COUNT; index += 1) {
       const bucket = buckets.find((candidate) => candidate.index === index);
       const uniqueUsers = nonNegativeInteger(bucket?.uniqueUsers);
       const mutedUsers = Math.min(uniqueUsers, nonNegativeInteger(bucket?.mutedUsers));
-      const voicePartial = voiceGloballyPartial || Boolean(voicePartialMask & (1 << index));
       const startMinutes = index * ACTIVITY_BUCKET_MINUTES;
       const endMinutes = startMinutes + ACTIVITY_BUCKET_MINUTES - 1;
+      const graph = personGraph(uniqueUsers, mutedUsers, graphLimit);
+      const peopleLabel = compactGraphCounts
+        ? compactGraphQuantity(uniqueUsers, "人")
+        : `${uniqueUsers}人`;
       lines.push(
-        `${formatClock(startMinutes)}-${formatClock(endMinutes)} | ${personGraph(uniqueUsers, mutedUsers, graphLimit)}${voicePartial ? "※" : ""}`,
+        `${formatClock(startMinutes)}-${formatClock(endMinutes)} | ${peopleLabel} |${graph ? ` ${graph}` : ""}`,
       );
     }
 
-    lines.push("", "【メッセージ数グラフ】");
+    lines.push("```", "", "【メッセージ数グラフ】", "```", "時間 | 件数 | グラフ");
     for (let index = 0; index < ACTIVITY_BUCKET_COUNT; index += 1) {
       const bucket = buckets.find((candidate) => candidate.index === index);
       const messageCount = nonNegativeInteger(bucket?.messageCount);
       const messagePartial = messageGloballyPartial || Boolean(messagePartialMask & (1 << index));
+      const graphMessageLabel = compactGraphCounts
+        ? compactGraphQuantity(messageCount, "件")
+        : `${messageCount}件`;
+      const messageLabel = messagePartial ? `${graphMessageLabel}以上` : graphMessageLabel;
       const startMinutes = index * ACTIVITY_BUCKET_MINUTES;
       const endMinutes = startMinutes + ACTIVITY_BUCKET_MINUTES - 1;
+      const graph = messageGraph(messageCount, graphLimit);
       lines.push(
-        `${formatClock(startMinutes)}-${formatClock(endMinutes)} | ${messageGraph(messageCount, messagePartial, graphLimit)}`,
+        `${formatClock(startMinutes)}-${formatClock(endMinutes)} | ${messageLabel} |${graph ? ` ${graph}` : ""}`,
       );
     }
 
     lines.push(
+      "```",
       "",
-      "※滞在人数グラフは■=ミュートなしの1人、□=枠内にミュート状態があった1人です。",
-      "※メッセージ数グラフは20件につき■1つです。長すぎる場合は末尾を…で省略します。",
+      "凡例：ミュート率は枠内にミュート状態があった人数/滞在人数を約分して表示します。",
+      "凡例：滞在人数グラフは■=ミュートなしの1人、□=枠内にミュート状態があった1人です。",
+      "凡例：メッセージ数グラフは20件につき■1つです。長すぎる場合は末尾を…で省略します。",
     );
+    if (compactGraphCounts && hasCompactedQuantities) {
+      lines.push("注意：数値が大きい時間帯は概数表示です。");
+    }
     if (messagePartialMask !== 0 || voicePartialMask !== 0 || messageGloballyPartial || voiceGloballyPartial) {
-      lines.push("※ Gateway再接続の影響で、この時間帯は一部の値に欠測または概算を含む可能性があります。");
+      lines.push("注意：一部の集計に欠測または概算があります。");
     }
 
     return lines.join("\n");
   };
 
   // 大きなサーバーや一時的な集計異常で数値の桁が増えても、Discordの
-  // 2000文字制限で詳細ログ全体が送信不能にならないよう、グラフだけを
-  // 段階的に短縮する。表の観測値とpartial表示は最後まで残す。
-  for (const graphLimit of [MAX_GRAPH_SYMBOLS_PER_ROW, 16, 12, 8, 4, 0]) {
-    const report = render(graphLimit);
-    if (report.length <= 2000) {
-      return report;
+  // 2000文字制限で詳細ログ全体が送信不能にならないよう、まずグラフを
+  // 段階的に短縮する。それでも超える場合だけ、数値を概数にして再試行する。
+  for (const compactGraphCounts of [false, true]) {
+    for (const graphLimit of [MAX_GRAPH_SYMBOLS_PER_ROW, 16, 12, 8, 4, 0]) {
+      const report = render(graphLimit, compactGraphCounts);
+      if (report.length <= 2000) {
+        return report;
+      }
     }
   }
 
@@ -459,7 +485,7 @@ const MAX_GRAPH_SYMBOLS_PER_ROW = 20;
 
 function personGraph(uniqueUsers: number, mutedUsers: number, maxSymbols: number): string {
   if (uniqueUsers === 0) {
-    return "（なし）";
+    return "";
   }
 
   const graphLimit = Math.max(0, Math.floor(maxSymbols));
@@ -471,28 +497,48 @@ function personGraph(uniqueUsers: number, mutedUsers: number, maxSymbols: number
   return uniqueUsers > graph.length ? `${graph}…` : graph;
 }
 
-function messageGraph(messageCount: number, partial: boolean, maxSymbols: number): string {
+function messageGraph(messageCount: number, maxSymbols: number): string {
   if (messageCount === 0) {
-    return partial ? "（なし）※" : "（なし）";
+    return "";
   }
 
   const graphLimit = Math.max(0, Math.floor(maxSymbols));
   const units = Math.ceil(messageCount / 20);
   const visibleUnits = Math.min(units, graphLimit);
   const graph = "■".repeat(visibleUnits);
-  const shortened = units > visibleUnits ? `${graph}…` : graph;
-  return partial ? `${shortened}※` : shortened;
+  return units > visibleUnits ? `${graph}…` : graph;
+}
+
+function compactGraphQuantity(value: number, suffix: string): string {
+  if (value < 10_000) {
+    return `${value}${suffix}`;
+  }
+  const scale = value >= 1_000_000_000_000
+    ? { divisor: 1_000_000_000_000, unit: "兆" }
+    : value >= 100_000_000
+      ? { divisor: 100_000_000, unit: "億" }
+      : { divisor: 10_000, unit: "万" };
+  const scaled = Number((value / scale.divisor).toPrecision(3));
+  return `約${scaled}${scale.unit}${suffix}`;
 }
 
 function formatMuteRatio(bucket: ActivityBucket | undefined): string {
-  const totalVoiceMs = Number(bucket?.totalVoiceMs ?? 0);
-  const safeTotalVoiceMs = Number.isFinite(totalVoiceMs) && totalVoiceMs > 0 ? totalVoiceMs : 0;
-  const mutedVoiceMs = Number(bucket?.mutedVoiceMs ?? 0);
-  const safeMutedVoiceMs = Number.isFinite(mutedVoiceMs) && mutedVoiceMs > 0
-    ? Math.min(safeTotalVoiceMs, mutedVoiceMs)
-    : 0;
-  const ratio = safeTotalVoiceMs > 0 ? (safeMutedVoiceMs / safeTotalVoiceMs) * 100 : 0;
-  return `${ratio.toFixed(1)}%`;
+  const totalUsers = nonNegativeInteger(bucket?.uniqueUsers);
+  const mutedUsers = Math.min(totalUsers, nonNegativeInteger(bucket?.mutedUsers));
+  if (totalUsers === 0) {
+    return "0/0";
+  }
+  const divisor = greatestCommonDivisor(mutedUsers, totalUsers);
+  return `${mutedUsers / divisor}/${totalUsers / divisor}`;
+}
+
+function greatestCommonDivisor(left: number, right: number): number {
+  let a = left;
+  let b = right;
+  while (b !== 0) {
+    [a, b] = [b, a % b];
+  }
+  return a || 1;
 }
 
 export function classifyManagedChannel(

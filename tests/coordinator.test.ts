@@ -1,6 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { NightCoordinator } from "../src/coordinator";
 import { japanDayStartMs } from "../src/activity";
+import { DiscordRateLimitError } from "../src/discord";
 import type { Env } from "../src/config";
 
 const env: Env = {
@@ -19,6 +20,7 @@ class MemorySql {
   readonly state = new Map<string, string>();
   readonly messageBuckets = new Map<string, number>();
   readonly dailyUsage = new Set<string>();
+  readonly channelDeleteQueue = new Set<string>();
   gatewaySequenceWriteCount = 0;
   managedChannels: Row[] = [{
     channel_id: "text-1",
@@ -51,6 +53,34 @@ class MemorySql {
 
     if (normalized.startsWith("SELECT channel_id, name, kind, date_jst FROM managed_channels")) {
       return { toArray: () => [...this.managedChannels] };
+    }
+
+    if (normalized.startsWith("SELECT q.channel_id, m.name AS expected_name, m.kind AS expected_kind")) {
+      const limit = Number(bindings[0]);
+      return {
+        toArray: () => [...this.channelDeleteQueue].sort().slice(0, limit).map((channelId) => {
+          const managed = this.managedChannels.find((channel) => channel.channel_id === channelId);
+          return {
+            channel_id: channelId,
+            expected_name: managed?.name ?? null,
+            expected_kind: managed?.kind ?? null,
+          };
+        }),
+      };
+    }
+
+    if (normalized.startsWith("INSERT OR IGNORE INTO channel_delete_queue")) {
+      this.channelDeleteQueue.add(String(bindings[0]));
+      return { toArray: () => [] };
+    }
+
+    if (normalized.startsWith("DELETE FROM channel_delete_queue")) {
+      this.channelDeleteQueue.delete(String(bindings[0]));
+      return { toArray: () => [] };
+    }
+
+    if (normalized.startsWith("SELECT COUNT(*) AS count FROM channel_delete_queue")) {
+      return { toArray: () => [{ count: this.channelDeleteQueue.size }] };
     }
 
     if (normalized.startsWith("INSERT INTO message_buckets")) {
@@ -128,7 +158,30 @@ function attachOpenSocket(coordinator: NightCoordinator) {
   return socket;
 }
 
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
 describe("NightCoordinator Gateway復旧", () => {
+  it("異常なRetry-Afterで再試行Alarmが無限時刻にならない", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-29T01:15:00+09:00"));
+    const storage = new MemoryStorage();
+    const coordinator = createCoordinator(storage);
+    const scheduleRetry = (coordinator as unknown as {
+      scheduleRetry: (operation: string, error: unknown) => Promise<void>;
+    }).scheduleRetry.bind(coordinator);
+
+    await scheduleRetry(
+      "open",
+      new DiscordRateLimitError(429, "GET", "/test", Number.POSITIVE_INFINITY),
+    );
+
+    expect(await storage.getAlarm()).toBe(Date.now() + 300_000);
+  });
+
   it("partial maskが残っている状態をhealthで正常扱いしない", () => {
     const storage = new MemoryStorage();
     const coordinator = createCoordinator(storage);
@@ -162,6 +215,15 @@ describe("NightCoordinator Gateway復旧", () => {
       }),
     );
     expect(invalidTimeResponse.status).toBe(400);
+
+    const outOfRangeTimeCoordinator = createCoordinator(new MemoryStorage());
+    const outOfRangeTimeResponse = await outOfRangeTimeCoordinator.fetch(
+      new Request("https://discord-shinya.internal/operation", {
+        method: "POST",
+        body: JSON.stringify({ operation: "close", scheduledTime: Number.MAX_SAFE_INTEGER }),
+      }),
+    );
+    expect(outOfRangeTimeResponse.status).toBe(400);
   });
 
   it("messageをSnowflakeの枠へ入れ、同じsequenceを二重加算しない", async () => {
@@ -238,6 +300,208 @@ describe("NightCoordinator Gateway復旧", () => {
 
     expect(storage.sql.messageBuckets.get("2026-08-29:15")).toBe(1);
     expect(storage.sql.state.get("gateway_last_sequence")).toBe("13");
+  });
+
+  it("Gateway終了待ち中もsequenceを維持し、遅延messageだけを一度集計する", async () => {
+    const storage = new MemoryStorage();
+    const coordinator = createCoordinator(storage);
+    const socket = attachOpenSocket(coordinator);
+    storage.sql.state.set("phase", "CLOSING");
+    storage.sql.state.set("close_stage", "gateway");
+    storage.sql.state.set("gateway_last_sequence", "12");
+
+    let resolveClose!: () => void;
+    const closePromise = new Promise<void>((resolve) => {
+      resolveClose = resolve;
+    });
+    (coordinator as unknown as {
+      gatewayClosePromises: WeakMap<WebSocket, Promise<void>>;
+    }).gatewayClosePromises.set(socket, closePromise);
+
+    const closeGatewayForNight = (coordinator as unknown as {
+      closeGatewayForNight: () => Promise<void>;
+    }).closeGatewayForNight.bind(coordinator);
+    const enqueueGatewayMessage = (coordinator as unknown as {
+      enqueueGatewayMessage: (socket: WebSocket, raw: string) => void;
+    }).enqueueGatewayMessage.bind(coordinator);
+    const enqueueGatewayClose = (coordinator as unknown as {
+      enqueueGatewayClose: (socket: WebSocket, code: number) => void;
+    }).enqueueGatewayClose.bind(coordinator);
+
+    const closing = closeGatewayForNight();
+    const messageId = snowflakeFor(japanDayStartMs("2026-08-29") + 8 * 60 * 60_000 - 1_000);
+    const dispatch = (sequence: number) => JSON.stringify({
+      op: 0,
+      t: "MESSAGE_CREATE",
+      s: sequence,
+      d: { id: messageId, channel_id: "text-1", author: { id: "user-1" } },
+    });
+    enqueueGatewayMessage(socket, dispatch(12)); // 既に処理済みの重複
+    enqueueGatewayMessage(socket, dispatch(13)); // 08:00前の遅延分
+    enqueueGatewayClose(socket, 1000);
+    resolveClose();
+
+    await closing;
+
+    expect(storage.sql.messageBuckets.get("2026-08-29:15")).toBe(1);
+    expect(storage.sql.state.get("gateway_last_sequence")).toBe("");
+    expect((coordinator as unknown as { gatewaySocket: WebSocket | null }).gatewaySocket).toBeNull();
+  });
+
+  it("socketがCLOSEDでもclose callback未処理なら最後のmessageを待つ", async () => {
+    const storage = new MemoryStorage();
+    const coordinator = createCoordinator(storage);
+    const socket = attachOpenSocket(coordinator);
+    (socket as unknown as { readyState: number }).readyState = WebSocket.CLOSED;
+    storage.sql.state.set("phase", "CLOSING");
+    storage.sql.state.set("close_stage", "gateway");
+    storage.sql.state.set("gateway_last_sequence", "12");
+
+    let resolveClose!: () => void;
+    const closePromise = new Promise<void>((resolve) => {
+      resolveClose = resolve;
+    });
+    (coordinator as unknown as {
+      gatewayClosePromises: WeakMap<WebSocket, Promise<void>>;
+    }).gatewayClosePromises.set(socket, closePromise);
+
+    const privateCoordinator = coordinator as unknown as {
+      closeGatewayForNight: () => Promise<void>;
+      enqueueGatewayMessage: (socket: WebSocket, raw: string) => void;
+      enqueueGatewayClose: (socket: WebSocket, code: number) => void;
+    };
+    let completed = false;
+    const closing = privateCoordinator.closeGatewayForNight().then(() => {
+      completed = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(completed).toBe(false);
+
+    const messageId = snowflakeFor(japanDayStartMs("2026-08-29") + 8 * 60 * 60_000 - 1_000);
+    privateCoordinator.enqueueGatewayMessage(socket, JSON.stringify({
+      op: 0,
+      t: "MESSAGE_CREATE",
+      s: 13,
+      d: { id: messageId, channel_id: "text-1", author: { id: "user-1" } },
+    }));
+    privateCoordinator.enqueueGatewayClose(socket, 1000);
+    resolveClose();
+
+    await closing;
+
+    expect(storage.sql.messageBuckets.get("2026-08-29:15")).toBe(1);
+    expect(storage.sql.state.get("gateway_last_sequence")).toBe("");
+    expect((coordinator as unknown as { gatewaySocket: WebSocket | null }).gatewaySocket).toBeNull();
+  });
+
+  it("Gateway close確認がtimeoutした場合は集計を欠測扱いにする", async () => {
+    vi.useFakeTimers();
+    const storage = new MemoryStorage();
+    const coordinator = createCoordinator(storage);
+    const socket = attachOpenSocket(coordinator);
+    storage.sql.state.set("phase", "CLOSING");
+    storage.sql.state.set("close_stage", "gateway");
+    (coordinator as unknown as {
+      gatewayClosePromises: WeakMap<WebSocket, Promise<void>>;
+    }).gatewayClosePromises.set(socket, new Promise<void>(() => undefined));
+
+    const closeGatewayForNight = (coordinator as unknown as {
+      closeGatewayForNight: () => Promise<void>;
+    }).closeGatewayForNight.bind(coordinator);
+    const closing = closeGatewayForNight();
+    await vi.advanceTimersByTimeAsync(2_000);
+    await closing;
+
+    expect(storage.sql.state.get("message_integrity")).toBe("partial");
+    expect(storage.sql.state.get("usage_integrity")).toBe("partial");
+    expect(storage.sql.state.get("voice_integrity")).toBe("partial");
+    expect(storage.sql.state.get("message_partial_mask")).toBe("65535");
+    expect(storage.sql.state.get("voice_partial_mask")).toBe("65535");
+    expect((coordinator as unknown as { gatewaySocket: WebSocket | null }).gatewaySocket).toBeNull();
+    vi.useRealTimers();
+  });
+
+  it("チャンネル作成失敗時のロールバック削除を3件に制限して次回へ残す", async () => {
+    const storage = new MemoryStorage();
+    const coordinator = createCoordinator(storage);
+    const channels = [
+      ...[1, 2, 3].map((index) => ({
+        id: `normal-text-${index}`,
+        name: `深夜限定テキスト${index}-08-29`,
+        type: 0,
+        kind: "normal_text",
+        parent_id: env.DISCORD_PARENT_CATEGORY_ID,
+      })),
+      ...[1, 2, 3].map((index) => ({
+        id: `normal-voice-${index}`,
+        name: `深夜限定通話${index}-08-29`,
+        type: 2,
+        kind: "normal_voice",
+        parent_id: env.DISCORD_PARENT_CATEGORY_ID,
+      })),
+      ...[1, 2].map((index) => ({
+        id: `deep-text-${index}`,
+        name: `深層-深夜限定テキスト${index}-08-29`,
+        type: 0,
+        kind: "deep_text",
+        parent_id: env.DISCORD_DEEP_PARENT_CATEGORY_ID,
+      })),
+      ...[1, 2].map((index) => ({
+        id: `deep-voice-${index}`,
+        name: `深層-深夜限定通話${index}-08-29`,
+        type: 2,
+        kind: "deep_voice",
+        parent_id: env.DISCORD_DEEP_PARENT_CATEGORY_ID,
+      })),
+    ];
+    storage.sql.managedChannels = channels.map((channel) => ({
+      channel_id: channel.id,
+      name: channel.name,
+      kind: channel.kind,
+      date_jst: "2026-08-29",
+    }));
+
+    const requests: Array<{ method: string; url: string }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      const url = String(input);
+      requests.push({ method, url });
+      if (method === "GET" && url.endsWith(`/guilds/${env.DISCORD_GUILD_ID}/channels`)) {
+        return new Response(JSON.stringify(channels), { status: 200 });
+      }
+      if (method === "DELETE" && url.includes("/channels/")) {
+        return new Response(null, { status: 204 });
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    }));
+
+    const rollbackOpeningChannels = (coordinator as unknown as {
+      rollbackOpeningChannels: (channelIds: readonly string[]) => Promise<boolean>;
+    }).rollbackOpeningChannels.bind(coordinator);
+    const complete = await rollbackOpeningChannels(channels.map((channel) => channel.id));
+
+    expect(complete).toBe(false);
+    expect(requests.filter((request) => request.method === "DELETE")).toHaveLength(3);
+    expect(storage.sql.channelDeleteQueue.size).toBe(7);
+  });
+
+  it("古い日付のclose要求で新しい夜を閉じない", async () => {
+    const storage = new MemoryStorage();
+    const coordinator = createCoordinator(storage);
+    storage.sql.state.set("phase", "ALL_OPEN");
+    storage.sql.state.set("date_jst", "2026-08-30");
+    const privateCoordinator = coordinator as unknown as {
+      beginClose: (dateJst: string) => Promise<void>;
+      continueClosing: () => Promise<void>;
+    };
+    const continueClosing = vi.spyOn(privateCoordinator, "continueClosing").mockResolvedValue();
+
+    await privateCoordinator.beginClose("2026-08-29");
+
+    expect(storage.sql.state.get("phase")).toBe("ALL_OPEN");
+    expect(storage.sql.state.get("date_jst")).toBe("2026-08-30");
+    expect(continueClosing).not.toHaveBeenCalled();
   });
 
   it("Opcode 7では1000では切断せず、session/sequenceを保持してRESUME待ちにする", async () => {
