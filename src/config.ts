@@ -650,7 +650,28 @@ function deepOverwrites(
   deepRoleId: string,
   botUserId?: string,
 ): PermissionOverwrite[] {
-  return stagingOverwrites(guildId, deepRoleId, botUserId);
+  const overwrites: PermissionOverwrite[] = [
+    buildPrivateOverwrite(guildId),
+    buildDeepRoleVisibilityOverwrite(deepRoleId),
+  ];
+  if (botUserId) {
+    overwrites.push({
+      id: botUserId,
+      type: 1,
+      allow: String(VIEW_CHANNEL_BIT | SEND_MESSAGES_BIT | CONNECT_BIT | SPEAK_BIT),
+      deny: String(THREAD_CREATION_BITS),
+    });
+  }
+  return overwrites;
+}
+
+function buildDeepRoleVisibilityOverwrite(roleId: string): PermissionOverwrite {
+  return {
+    id: roleId,
+    type: 0,
+    allow: String(VIEW_CHANNEL_BIT),
+    deny: String(THREAD_CREATION_BITS),
+  };
 }
 
 function formatClock(totalMinutes: number): string {

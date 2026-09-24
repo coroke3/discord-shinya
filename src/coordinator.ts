@@ -700,49 +700,6 @@ export class NightCoordinator {
         this.registerManagedChannel(channel.id, definition.name, definition.kind, dateJst);
       }
 
-      const firstText = this.firstRegistered("normal_text");
-      const firstDeepText = this.firstRegistered("deep_text");
-      if (!firstText || !firstDeepText) {
-        throw new Error("Required announcement text channels were not registered");
-      }
-
-      // The Gateway is READY before this call, so both bot-generated
-      // announcements are counted by MESSAGE_CREATE without reading history.
-      // Each flag makes a partial retry idempotent: a successful normal
-      // announcement is not posted again when the deep one is retried.
-      if (this.getState("announcement_sent") !== "1") {
-        if (Date.now() >= japanNightEndMs(dateJst)) {
-          await this.scheduleAlarmAt(Date.now() + 1_000);
-          return;
-        }
-        await createAnnouncement(
-          this.env,
-          firstText.channel_id,
-          {
-            ...buildAnnouncementPayload(this.env.DISCORD_MENTION_ROLE_ID),
-            // チャンネルIDをnonceに含め、作成途中でチャンネルをロール
-            // バックしても、別チャンネルの通知と衝突しないようにする。
-            nonce: `open-${firstText.channel_id}`,
-          },
-        );
-        this.setState("announcement_sent", "1");
-      }
-      if (this.getState("deep_announcement_sent") !== "1") {
-        if (Date.now() >= japanNightEndMs(dateJst)) {
-          await this.scheduleAlarmAt(Date.now() + 1_000);
-          return;
-        }
-        await createAnnouncement(
-          this.env,
-          firstDeepText.channel_id,
-          {
-            ...buildAnnouncementPayload(this.env.DISCORD_MENTION_ROLE_ID),
-            nonce: `open-${firstDeepText.channel_id}`,
-          },
-        );
-        this.setState("deep_announcement_sent", "1");
-      }
-
       // 10チャンネルの作成とDB登録が完了するまで、通常チャンネルも
       // @everyoneには非公開のstaging状態にする。作成途中の投稿raceを
       // 避け、全件そろった後に通常6チャンネルだけ公開する。
@@ -766,6 +723,31 @@ export class NightCoordinator {
           );
         }
         this.setState("normal_channels_public", "1");
+      }
+
+      // 通常チャンネル6個の公開権限をすべて反映してから、作成通知を送る。
+      // Gateway READY後の投稿なのでMESSAGE_CREATEで集計され、nonceと状態flagで
+      // 途中失敗時の二重投稿も抑止する。
+      const firstText = this.firstRegistered("normal_text");
+      if (!firstText) {
+        throw new Error("Required normal announcement channel was not registered");
+      }
+      if (this.getState("announcement_sent") !== "1") {
+        if (Date.now() >= japanNightEndMs(dateJst)) {
+          await this.scheduleAlarmAt(Date.now() + 1_000);
+          return;
+        }
+        await createAnnouncement(
+          this.env,
+          firstText.channel_id,
+          {
+            ...buildAnnouncementPayload(this.env.DISCORD_MENTION_ROLE_ID),
+            // チャンネルIDをnonceに含め、作成途中でチャンネルをロール
+            // バックしても、別チャンネルの通知と衝突しないようにする。
+            nonce: `open-${firstText.channel_id}`,
+          },
+        );
+        this.setState("announcement_sent", "1");
       }
 
       if (Date.now() >= japanNightEndMs(dateJst)) {
@@ -924,6 +906,29 @@ export class NightCoordinator {
         buildDeepRolePublicOverwrite(this.env.DISCORD_DEEP_ROLE_ID),
       );
     }
+
+    // 深層4チャンネルの公開権限がすべて整った後で、深層テキストへ通知する。
+    // 通知に失敗した場合はpending_operationとAlarmで公開処理ごと再試行する。
+    if (this.getState("deep_announcement_sent") !== "1") {
+      const firstDeepText = this.firstRegistered("deep_text");
+      if (!firstDeepText) {
+        throw new Error("Required deep announcement channel was not registered");
+      }
+      if (Date.now() >= japanNightEndMs(dateJst)) {
+        await this.scheduleAlarmAt(Date.now() + 1_000);
+        return;
+      }
+      await createAnnouncement(
+        this.env,
+        firstDeepText.channel_id,
+        {
+          ...buildAnnouncementPayload(this.env.DISCORD_MENTION_ROLE_ID),
+          nonce: `open-${firstDeepText.channel_id}`,
+        },
+      );
+      this.setState("deep_announcement_sent", "1");
+    }
+
     this.setState("phase", "ALL_OPEN");
     this.setState("pending_operation", "");
     await this.scheduleGatewayWatchdog();

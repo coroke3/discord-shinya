@@ -11,6 +11,7 @@ import {
   japanDateKey,
   operationForScheduledTime,
   THREAD_CREATION_BITS,
+  VIEW_CHANNEL_BIT,
 } from "../src/config";
 
 describe("新しい深夜チャンネル構成", () => {
@@ -52,6 +53,12 @@ describe("新しい深夜チャンネル構成", () => {
       type: 0,
       allow: "0",
       deny: String(1024 + THREAD_CREATION_BITS),
+    });
+    expect(privateDeep?.permission_overwrites).toContainEqual({
+      id: "88",
+      type: 0,
+      allow: String(VIEW_CHANNEL_BIT),
+      deny: String(THREAD_CREATION_BITS),
     });
     expect(definitions.find((definition) => definition.kind === "normal_text")?.permission_overwrites)
       .toContainEqual({

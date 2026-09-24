@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { NightCoordinator } from "../src/coordinator";
 import { japanDayStartMs } from "../src/activity";
 import { DiscordRateLimitError } from "../src/discord";
-import type { Env } from "../src/config";
+import { channelNames, type Env } from "../src/config";
 
 const env: Env = {
   DISCORD_BOT_TOKEN: "test-token",
@@ -53,6 +53,18 @@ class MemorySql {
 
     if (normalized.startsWith("SELECT channel_id, name, kind, date_jst FROM managed_channels")) {
       return { toArray: () => [...this.managedChannels] };
+    }
+
+    if (normalized.startsWith("INSERT OR REPLACE INTO managed_channels")) {
+      const [channelId, name, kind, dateJst] = bindings.map(String);
+      const existingIndex = this.managedChannels.findIndex((row) => row.channel_id === channelId);
+      const channel = { channel_id: channelId, name, kind, date_jst: dateJst };
+      if (existingIndex === -1) {
+        this.managedChannels.push(channel);
+      } else {
+        this.managedChannels[existingIndex] = channel;
+      }
+      return { toArray: () => [] };
     }
 
     if (normalized.startsWith("SELECT q.channel_id, m.name AS expected_name, m.kind AS expected_kind")) {
@@ -165,6 +177,120 @@ afterEach(() => {
 });
 
 describe("NightCoordinator Gateway復旧", () => {
+  it("通常チャンネルの権限設定完了後に作成通知を送る", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-29T00:01:00+09:00"));
+    const storage = new MemoryStorage();
+    storage.sql.managedChannels = [];
+    const coordinator = createCoordinator(storage);
+    storage.sql.state.set("phase", "OPENING");
+    storage.sql.state.set("date_jst", "2026-08-29");
+    storage.sql.state.set("opening_cleanup_done", "1");
+    storage.sql.state.set("gateway_bot_user_id", "bot-user");
+    const calls: Array<{ method: string; path: string }> = [];
+    let nextChannelId = 0;
+
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+      const method = init?.method ?? "GET";
+      calls.push({ method, path: url.pathname });
+
+      if (method === "GET") {
+        return Response.json([]);
+      }
+      if (method === "POST" && url.pathname === `/api/v10/guilds/${env.DISCORD_GUILD_ID}/channels`) {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return Response.json({ ...body, id: `channel-${nextChannelId++}` });
+      }
+      return new Response(null, { status: 204 });
+    }));
+
+    const finishOpenInternal = (coordinator as unknown as {
+      finishOpenInternal: () => Promise<void>;
+    }).finishOpenInternal.bind(coordinator);
+    await finishOpenInternal();
+
+    const permissionIndexes = calls
+      .map((call, index) => call.method === "PUT" && call.path.includes("/permissions/") ? index : -1)
+      .filter((index) => index >= 0);
+    const announcementIndex = calls.findIndex((call) =>
+      call.method === "POST" && call.path.endsWith("/messages")
+    );
+    expect(permissionIndexes).toHaveLength(6);
+    expect(announcementIndex).toBeGreaterThan(Math.max(...permissionIndexes));
+    expect(storage.sql.state.get("announcement_sent")).toBe("1");
+    expect(storage.sql.state.get("phase")).toBe("SEPARATED");
+  });
+
+  it("深層チャンネル4個の権限設定完了後に深層通知を送る", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-29T03:00:00+09:00"));
+    const storage = new MemoryStorage();
+    const names = channelNames("08-29");
+    const deepChannels = [
+      ...names.deepText.map((name, index) => ({
+        id: `deep-text-${index}`,
+        name,
+        type: 0,
+        kind: "deep_text",
+        parent_id: env.DISCORD_DEEP_PARENT_CATEGORY_ID,
+        date_jst: "2026-08-29",
+      })),
+      ...names.deepVoice.map((name, index) => ({
+        id: `deep-voice-${index}`,
+        name,
+        type: 2,
+        kind: "deep_voice",
+        parent_id: env.DISCORD_DEEP_PARENT_CATEGORY_ID,
+        date_jst: "2026-08-29",
+      })),
+    ];
+    storage.sql.managedChannels = deepChannels.map((channel) => ({
+      channel_id: channel.id,
+      name: channel.name,
+      kind: channel.kind,
+      date_jst: channel.date_jst,
+    }));
+    const coordinator = createCoordinator(storage);
+    storage.sql.state.set("phase", "SEPARATED");
+    storage.sql.state.set("date_jst", "2026-08-29");
+    storage.sql.state.set("pending_operation", "open_deep");
+    storage.sql.state.set("deep_announcement_sent", "0");
+    attachOpenSocket(coordinator);
+    const calls: Array<{ method: string; path: string }> = [];
+
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+      const method = init?.method ?? "GET";
+      calls.push({ method, path: url.pathname });
+      if (method === "GET") {
+        return Response.json(deepChannels.map(({ id, name, type, parent_id }) => ({
+          id,
+          name,
+          type,
+          parent_id,
+        })));
+      }
+      return new Response(null, { status: 204 });
+    }));
+
+    const beginOpenDeepInternal = (coordinator as unknown as {
+      beginOpenDeepInternal: (dateJst: string) => Promise<void>;
+    }).beginOpenDeepInternal.bind(coordinator);
+    await beginOpenDeepInternal("2026-08-29");
+
+    const permissionIndexes = calls
+      .map((call, index) => call.method === "PUT" && call.path.includes("/permissions/") ? index : -1)
+      .filter((index) => index >= 0);
+    const announcementIndex = calls.findIndex((call) =>
+      call.method === "POST" && call.path.endsWith("/messages")
+    );
+    expect(permissionIndexes).toHaveLength(8);
+    expect(announcementIndex).toBeGreaterThan(Math.max(...permissionIndexes));
+    expect(storage.sql.state.get("deep_announcement_sent")).toBe("1");
+    expect(storage.sql.state.get("phase")).toBe("ALL_OPEN");
+  });
+
   it("異常なRetry-Afterで再試行Alarmが無限時刻にならない", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-29T01:15:00+09:00"));
