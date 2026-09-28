@@ -21,6 +21,8 @@ class MemorySql {
   readonly messageBuckets = new Map<string, number>();
   readonly dailyUsage = new Set<string>();
   readonly channelDeleteQueue = new Set<string>();
+  readonly deepRoleMembers = new Set<string>();
+  readonly roleSyncQueue = new Map<string, "add" | "remove">();
   gatewaySequenceWriteCount = 0;
   managedChannels: Row[] = [{
     channel_id: "text-1",
@@ -106,6 +108,59 @@ class MemorySql {
       return { toArray: () => [] };
     }
 
+    if (normalized.startsWith("SELECT user_id, action FROM role_sync_queue ORDER BY user_id LIMIT")) {
+      const limit = Number(bindings[0]);
+      return {
+        toArray: () => [...this.roleSyncQueue.entries()]
+          .sort(([left], [right]) => left.localeCompare(right))
+          .slice(0, limit)
+          .map(([user_id, action]) => ({ user_id, action })),
+      };
+    }
+
+    if (normalized.startsWith("SELECT COUNT(*) AS count FROM role_sync_queue")) {
+      return { toArray: () => [{ count: this.roleSyncQueue.size }] };
+    }
+
+    if (normalized.startsWith("SELECT user_id FROM daily_usage WHERE date_jst = ?")) {
+      const dateJst = String(bindings[0]);
+      const prefix = `${dateJst}:`;
+      return {
+        toArray: () => [...this.dailyUsage]
+          .filter((entry) => entry.startsWith(prefix))
+          .map((entry) => ({ user_id: entry.slice(prefix.length) })),
+      };
+    }
+
+    if (normalized.startsWith("SELECT user_id FROM deep_role_members")) {
+      return { toArray: () => [...this.deepRoleMembers].map((user_id) => ({ user_id })) };
+    }
+
+    if (normalized.startsWith("INSERT OR REPLACE INTO role_sync_queue")) {
+      this.roleSyncQueue.set(String(bindings[0]), normalized.includes("'add'") ? "add" : "remove");
+      return { toArray: () => [] };
+    }
+
+    if (normalized.startsWith("DELETE FROM role_sync_queue WHERE user_id = ?")) {
+      this.roleSyncQueue.delete(String(bindings[0]));
+      return { toArray: () => [] };
+    }
+
+    if (normalized === "DELETE FROM role_sync_queue") {
+      this.roleSyncQueue.clear();
+      return { toArray: () => [] };
+    }
+
+    if (normalized.startsWith("INSERT OR IGNORE INTO deep_role_members")) {
+      this.deepRoleMembers.add(String(bindings[0]));
+      return { toArray: () => [] };
+    }
+
+    if (normalized.startsWith("DELETE FROM deep_role_members WHERE user_id = ?")) {
+      this.deepRoleMembers.delete(String(bindings[0]));
+      return { toArray: () => [] };
+    }
+
     return { toArray: () => [] };
   }
 }
@@ -177,7 +232,7 @@ afterEach(() => {
 });
 
 describe("NightCoordinator Gateway復旧", () => {
-  it("通常チャンネルの権限設定完了後に作成通知を送る", async () => {
+  it("通常・深層通知を0時のチャンネル作成と権限設定の完了後に送る", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-29T00:01:00+09:00"));
     const storage = new MemoryStorage();
@@ -187,20 +242,34 @@ describe("NightCoordinator Gateway復旧", () => {
     storage.sql.state.set("date_jst", "2026-08-29");
     storage.sql.state.set("opening_cleanup_done", "1");
     storage.sql.state.set("gateway_bot_user_id", "bot-user");
-    const calls: Array<{ method: string; path: string }> = [];
+    const calls: Array<{
+      method: string;
+      path: string;
+      body?: Record<string, unknown>;
+      responseId?: string;
+    }> = [];
     let nextChannelId = 0;
 
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
       const method = init?.method ?? "GET";
-      calls.push({ method, path: url.pathname });
+      const body = init?.body === undefined
+        ? undefined
+        : JSON.parse(String(init.body)) as Record<string, unknown>;
+      const call: (typeof calls)[number] = {
+        method,
+        path: url.pathname,
+        ...(body ? { body } : {}),
+      };
+      calls.push(call);
 
       if (method === "GET") {
         return Response.json([]);
       }
       if (method === "POST" && url.pathname === `/api/v10/guilds/${env.DISCORD_GUILD_ID}/channels`) {
-        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-        return Response.json({ ...body, id: `channel-${nextChannelId++}` });
+        const channelId = `channel-${nextChannelId++}`;
+        call.responseId = channelId;
+        return Response.json({ ...body, id: channelId });
       }
       return new Response(null, { status: 204 });
     }));
@@ -210,19 +279,40 @@ describe("NightCoordinator Gateway復旧", () => {
     }).finishOpenInternal.bind(coordinator);
     await finishOpenInternal();
 
+    const channelCreateIndexes = calls
+      .map((call, index) =>
+        call.method === "POST" && call.path === `/api/v10/guilds/${env.DISCORD_GUILD_ID}/channels`
+          ? index
+          : -1,
+      )
+      .filter((index) => index >= 0);
     const permissionIndexes = calls
       .map((call, index) => call.method === "PUT" && call.path.includes("/permissions/") ? index : -1)
       .filter((index) => index >= 0);
-    const announcementIndex = calls.findIndex((call) =>
-      call.method === "POST" && call.path.endsWith("/messages")
-    );
+    const messageIndexes = calls
+      .map((call, index) => call.method === "POST" && call.path.endsWith("/messages") ? index : -1)
+      .filter((index) => index >= 0);
+    const names = channelNames("08-29");
+    const firstNormalText = calls.find((call) => call.body?.name === names.text[0]);
+    const firstDeepText = calls.find((call) => call.body?.name === names.deepText[0]);
+
+    expect(channelCreateIndexes).toHaveLength(10);
     expect(permissionIndexes).toHaveLength(6);
-    expect(announcementIndex).toBeGreaterThan(Math.max(...permissionIndexes));
+    expect(messageIndexes).toHaveLength(2);
+    expect(firstNormalText?.responseId).toBeDefined();
+    expect(firstDeepText?.responseId).toBeDefined();
+    expect(calls[messageIndexes[0]]?.path)
+      .toBe(`/api/v10/channels/${firstNormalText?.responseId}/messages`);
+    expect(calls[messageIndexes[1]]?.path)
+      .toBe(`/api/v10/channels/${firstDeepText?.responseId}/messages`);
+    expect(messageIndexes[0]).toBeGreaterThan(Math.max(...channelCreateIndexes, ...permissionIndexes));
+    expect(messageIndexes[1]).toBeGreaterThan(Math.max(...channelCreateIndexes, ...permissionIndexes));
     expect(storage.sql.state.get("announcement_sent")).toBe("1");
+    expect(storage.sql.state.get("deep_announcement_sent")).toBe("1");
     expect(storage.sql.state.get("phase")).toBe("SEPARATED");
   });
 
-  it("深層チャンネル4個の権限設定完了後に深層通知を送る", async () => {
+  it("深層通知は03:00の公開処理では送らない", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-29T03:00:00+09:00"));
     const storage = new MemoryStorage();
@@ -263,6 +353,7 @@ describe("NightCoordinator Gateway復旧", () => {
       const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
       const method = init?.method ?? "GET";
       calls.push({ method, path: url.pathname });
+
       if (method === "GET") {
         return Response.json(deepChannels.map(({ id, name, type, parent_id }) => ({
           id,
@@ -282,12 +373,9 @@ describe("NightCoordinator Gateway復旧", () => {
     const permissionIndexes = calls
       .map((call, index) => call.method === "PUT" && call.path.includes("/permissions/") ? index : -1)
       .filter((index) => index >= 0);
-    const announcementIndex = calls.findIndex((call) =>
-      call.method === "POST" && call.path.endsWith("/messages")
-    );
     expect(permissionIndexes).toHaveLength(8);
-    expect(announcementIndex).toBeGreaterThan(Math.max(...permissionIndexes));
-    expect(storage.sql.state.get("deep_announcement_sent")).toBe("1");
+    expect(calls.some((call) => call.method === "POST" && call.path.endsWith("/messages"))).toBe(false);
+    expect(storage.sql.state.get("deep_announcement_sent")).toBe("0");
     expect(storage.sql.state.get("phase")).toBe("ALL_OPEN");
   });
 
@@ -816,5 +904,47 @@ describe("NightCoordinator Gateway復旧", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("NightCoordinator 深層ロール同期", () => {
+  it("当日利用者には古い付与記録があってもロールを再確認する", () => {
+    const storage = new MemoryStorage();
+    const coordinator = createCoordinator(storage);
+    const userId = "654321098765432109";
+    const dateJst = "2026-08-29";
+    storage.sql.deepRoleMembers.add(userId);
+    storage.sql.dailyUsage.add(`${dateJst}:${userId}`);
+
+    const prepareRoleSync = (coordinator as unknown as {
+      prepareRoleSync: (date: string) => void;
+    }).prepareRoleSync.bind(coordinator);
+    prepareRoleSync(dateJst);
+
+    expect(storage.sql.roleSyncQueue.get(userId)).toBe("add");
+  });
+
+  it("addが404になったメンバーの古い記録を消し、再参加後の付与を再試行する", async () => {
+    const storage = new MemoryStorage();
+    const coordinator = createCoordinator(storage);
+    const userId = "654321098765432109";
+    const dateJst = "2026-08-29";
+    storage.sql.deepRoleMembers.add(userId);
+    storage.sql.roleSyncQueue.set(userId, "add");
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 404 })));
+
+    const privateCoordinator = coordinator as unknown as {
+      processRoleSync: (date: string) => Promise<void>;
+      prepareRoleSync: (date: string) => void;
+    };
+    await privateCoordinator.processRoleSync(dateJst);
+
+    expect(storage.sql.deepRoleMembers.has(userId)).toBe(false);
+    expect(storage.sql.roleSyncQueue.has(userId)).toBe(false);
+
+    storage.sql.dailyUsage.add(`${dateJst}:${userId}`);
+    privateCoordinator.prepareRoleSync(dateJst);
+
+    expect(storage.sql.roleSyncQueue.get(userId)).toBe("add");
   });
 });

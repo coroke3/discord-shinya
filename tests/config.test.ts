@@ -220,4 +220,17 @@ describe("新しい深夜チャンネル構成", () => {
       "DISCORD_DEEP_PARENT_CATEGORY_ID must differ from DISCORD_PARENT_CATEGORY_ID",
     );
   });
+
+  it("Discord APIへ渡すSecretとIDの空白を実行前に拒否する", () => {
+    const issues = getConfigIssues({
+      DISCORD_BOT_TOKEN: "test-token\n",
+      DISCORD_GUILD_ID: " 123456789012345678 ",
+    });
+
+    expect(issues).toContain("DISCORD_BOT_TOKEN must not contain whitespace");
+    expect(issues).toContain(
+      "DISCORD_GUILD_ID must not contain leading or trailing whitespace",
+    );
+    expect(issues.join(" ")).not.toContain("test-token");
+  });
 });

@@ -750,6 +750,28 @@ export class NightCoordinator {
         this.setState("announcement_sent", "1");
       }
 
+      // 深層チャンネルは作成時に深層ロールの閲覧権限を設定済み。
+      // 03:00の全体公開を待たず、作成・権限設定が完了した0時台に通知する。
+      const firstDeepText = this.firstRegistered("deep_text");
+      if (!firstDeepText) {
+        throw new Error("Required deep announcement channel was not registered");
+      }
+      if (this.getState("deep_announcement_sent") !== "1") {
+        if (Date.now() >= japanNightEndMs(dateJst)) {
+          await this.scheduleAlarmAt(Date.now() + 1_000);
+          return;
+        }
+        await createAnnouncement(
+          this.env,
+          firstDeepText.channel_id,
+          {
+            ...buildAnnouncementPayload(this.env.DISCORD_MENTION_ROLE_ID),
+            nonce: `open-${firstDeepText.channel_id}`,
+          },
+        );
+        this.setState("deep_announcement_sent", "1");
+      }
+
       if (Date.now() >= japanNightEndMs(dateJst)) {
         await this.scheduleAlarmAt(Date.now() + 1_000);
         return;
@@ -905,28 +927,6 @@ export class NightCoordinator {
         channel.channel_id,
         buildDeepRolePublicOverwrite(this.env.DISCORD_DEEP_ROLE_ID),
       );
-    }
-
-    // 深層4チャンネルの公開権限がすべて整った後で、深層テキストへ通知する。
-    // 通知に失敗した場合はpending_operationとAlarmで公開処理ごと再試行する。
-    if (this.getState("deep_announcement_sent") !== "1") {
-      const firstDeepText = this.firstRegistered("deep_text");
-      if (!firstDeepText) {
-        throw new Error("Required deep announcement channel was not registered");
-      }
-      if (Date.now() >= japanNightEndMs(dateJst)) {
-        await this.scheduleAlarmAt(Date.now() + 1_000);
-        return;
-      }
-      await createAnnouncement(
-        this.env,
-        firstDeepText.channel_id,
-        {
-          ...buildAnnouncementPayload(this.env.DISCORD_MENTION_ROLE_ID),
-          nonce: `open-${firstDeepText.channel_id}`,
-        },
-      );
-      this.setState("deep_announcement_sent", "1");
     }
 
     this.setState("phase", "ALL_OPEN");
@@ -1297,13 +1297,14 @@ export class NightCoordinator {
     const detectedSet = new Set(detected);
     const usagePartial = this.getIntegrity("usage_integrity") === "partial";
 
+    // deep_role_membersはBotが最後に付与した記録で、Discord上の現在状態
+    // そのものではない。退出・再参加や手動変更でずれるため、当日利用者へは
+    // 冪等なPUTで再付与を試みる。実API処理は10件ずつAlarmで分割する。
     for (const userId of detectedSet) {
-      if (!currentSet.has(userId)) {
-        this.ctx.storage.sql.exec(
-          "INSERT OR REPLACE INTO role_sync_queue (user_id, action) VALUES (?, 'add')",
-          userId,
-        );
-      }
+      this.ctx.storage.sql.exec(
+        "INSERT OR REPLACE INTO role_sync_queue (user_id, action) VALUES (?, 'add')",
+        userId,
+      );
     }
 
     if (!usagePartial) {
@@ -1380,14 +1381,12 @@ export class NightCoordinator {
         this.ctx.storage.sql.exec("DELETE FROM role_sync_queue WHERE user_id = ?", item.user_id);
       } catch (error) {
         if (error instanceof DiscordApiError && error.status === 404) {
-          // The member may have left the guild between detection and the
-          // batch. There is no role mutation left to perform for that user.
-          if (item.action === "remove") {
-            this.ctx.storage.sql.exec(
-              "DELETE FROM deep_role_members WHERE user_id = ?",
-              item.user_id,
-            );
-          }
+          // メンバーが不在なら付与済みとはみなせない。addの404後も古い
+          // キャッシュを残すと、後日再参加して利用した際に再付与されない。
+          this.ctx.storage.sql.exec(
+            "DELETE FROM deep_role_members WHERE user_id = ?",
+            item.user_id,
+          );
           this.ctx.storage.sql.exec("DELETE FROM role_sync_queue WHERE user_id = ?", item.user_id);
           continue;
         }

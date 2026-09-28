@@ -105,8 +105,16 @@ export function getConfigIssues(env: Partial<Env>): string[] {
   const issues: string[] = [];
 
   for (const key of REQUIRED_CONFIG_KEYS) {
-    if (!env[key]?.trim()) {
+    const value = env[key];
+    if (!value?.trim()) {
       issues.push(`${key} is missing`);
+    } else if (key === "DISCORD_BOT_TOKEN" && /\s/.test(value)) {
+      // Authorizationヘッダーに渡す値。改行などが混ざるとfetchが
+      // Discordへ接続する前にTypeErrorになるため、設定段階で拒否する。
+      issues.push(`${key} must not contain whitespace`);
+    } else if (value !== value.trim()) {
+      // 検証側だけtrimしてAPIパス等へ未加工値を渡す不整合を防ぐ。
+      issues.push(`${key} must not contain leading or trailing whitespace`);
     }
   }
 
